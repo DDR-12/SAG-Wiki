@@ -394,7 +394,9 @@ impl Store {
             text_preparation: PreparationBudget::new(TEXT_PREPARATION_BUDGET),
         };
         if let Some(saved) = saved {
-            let previous: Settings = serde_json::from_str(&saved)?;
+            let mut parsed: serde_json::Value = serde_json::from_str(&saved)?;
+            crate::llm::migrate_settings_value(&mut parsed);
+            let previous: Settings = serde_json::from_value(parsed)?;
             if previous.retrieval_version < crate::sag2_v10::VERSION {
                 let updated = store.settings()?;
                 if previous.retrieval.chunk_chars != updated.retrieval.chunk_chars {
@@ -432,7 +434,9 @@ impl Store {
             .optional()?;
         let mut settings = match value {
             Some(v) => {
-                let mut settings: Settings = serde_json::from_str(&v)?;
+                let mut parsed: serde_json::Value = serde_json::from_str(&v).context("设置格式无效")?;
+                let secrets = crate::llm::migrate_settings_value(&mut parsed);
+                let mut settings: Settings = serde_json::from_value(parsed.clone()).context("设置格式无效")?;
                 if settings.retrieval_version < crate::sag2_v10::VERSION {
                     let r = &settings.retrieval;
                     if r.candidate_k == 50 && r.seed_k == 10 && r.max_hops == 1 && r.expansion_term_limit == 20 && r.top_k == 10 && r.chunk_chars == 1000 {
@@ -441,16 +445,36 @@ impl Store {
                     settings.retrieval.max_hops = settings.retrieval.max_hops.min(2);
                     settings.retrieval_version = crate::sag2_v10::VERSION;
                 }
+                if secrets.changed {
+                    self.persist_model_migration(&parsed, &secrets)?;
+                }
                 settings
             },
             None => Settings::default(),
         };
+        crate::llm::normalize_provider("answer", &mut settings.answer);
+        crate::llm::normalize_provider("jev", &mut settings.jev);
         settings.mineru.enabled = crate::mineru::has_key(self.docling.data_directory(), &settings.mineru)?;
         Ok(settings)
     }
+    fn persist_model_migration(&self, parsed: &serde_json::Value, secrets: &crate::llm::MigratedSecrets) -> Result<()> {
+        let directory = self.docling.data_directory();
+        for (kind, key) in [("answer", &secrets.answer), ("jev", &secrets.jev)] {
+            if let Some(key) = key {
+                if !crate::models::has_secret(directory, kind)? {
+                    crate::models::save_secret(directory, kind, key)?;
+                }
+            }
+        }
+        self.connection().execute(
+            "INSERT INTO preferences VALUES(1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value",
+            [parsed.to_string()],
+        )?;
+        Ok(())
+    }
     pub fn validate_settings(s: &Settings) -> Result<()> {
         s.runtime.validate().map_err(anyhow::Error::msg)?;
-        if s.answer.auth_mode != ModelAuthMode::Bearer {
+        if s.answer.auth_mode != ModelAuthMode::Bearer && !crate::llm::allows_missing_key(&s.answer) {
             bail!("问答模型需要 API Key 鉴权；无需鉴权选项仅适用于 Jev")
         }
         anyhow::ensure!(s.search_summary_sources > 0, "自动问答参考数量必须大于 0");
@@ -2962,6 +2986,54 @@ while [ ! -f "$(dirname "$0")/release" ]; do sleep 0.02; done
         assert_eq!(upgraded.search_files("Original", &[], 5).unwrap().len(), 1);
         drop(upgraded);
         assert_eq!(Store::open(&path).unwrap().chunk_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn legacy_model_config_migrates_without_dropping_settings_or_keeping_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.sqlite");
+        let store = Store::open(&path).unwrap();
+        let mut old = serde_json::to_value(Settings::default()).unwrap();
+        old["theme"] = serde_json::json!("dark");
+        old["retrieval"]["candidate_k"] = serde_json::json!(70);
+        old["model_profiles"] = serde_json::json!({"gpt-4o":{"system_prompt":"保留","sag2_enabled":true,"mcp_servers":[]}});
+        let answer = old["answer"].as_object_mut().unwrap();
+        answer.remove("url");
+        answer.remove("model");
+        answer.remove("provider");
+        answer.insert("base_url".into(), serde_json::json!("https://api.openai.com/v1"));
+        answer.insert("model_name".into(), serde_json::json!("gpt-4o"));
+        answer.insert("models".into(), serde_json::json!("gpt-4o, gpt-4o-mini"));
+        answer.insert("api_key".into(), serde_json::json!("legacy-answer-key"));
+        answer.insert("reasoning_effort".into(), serde_json::json!("low"));
+        old["jev"].as_object_mut().unwrap().remove("provider");
+        old["jev"]["url"] = serde_json::json!("https://scorer.example/decisions");
+        old["jev"]["model"] = serde_json::json!("custom-jev");
+        old["jev"]["key"] = serde_json::json!("legacy-jev-key");
+        store.connection().execute("INSERT INTO preferences VALUES(1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value", [old.to_string()]).unwrap();
+        let settings = store.settings().unwrap();
+        assert_eq!(settings.theme, "dark");
+        assert_eq!(settings.retrieval.candidate_k, 70);
+        assert_eq!(settings.model_profiles["gpt-4o"].system_prompt, "保留");
+        assert_eq!(settings.answer.url, "https://api.openai.com/v1");
+        assert_eq!(settings.answer.model, "gpt-4o");
+        assert_eq!(settings.answer.models, vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]);
+        assert_eq!(settings.answer.provider, "openai");
+        assert!(settings.answer.has_key);
+        assert_eq!(settings.answer.reasoning_effort, Some(crate::types::ReasoningEffort::Low));
+        assert_eq!(settings.jev.url, "https://scorer.example/decisions");
+        assert_eq!(settings.jev.model, "custom-jev");
+        assert_eq!(settings.jev.provider, "custom");
+        assert!(settings.jev.has_key);
+        let stored: String = store.connection().query_row("SELECT value FROM preferences WHERE id=1", [], |row| row.get(0)).unwrap();
+        assert!(!stored.contains("legacy-answer-key"));
+        assert!(!stored.contains("legacy-jev-key"));
+        assert!(!stored.contains("api_key"));
+        assert_eq!(crate::models::secret(dir.path(), "answer").unwrap(), "legacy-answer-key");
+        assert_eq!(crate::models::secret(dir.path(), "jev").unwrap(), "legacy-jev-key");
+        let again = store.settings().unwrap();
+        assert_eq!(again.answer.model, "gpt-4o");
+        assert_eq!(crate::models::secret(dir.path(), "answer").unwrap(), "legacy-answer-key");
     }
 
     #[test]

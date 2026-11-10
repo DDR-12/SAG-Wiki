@@ -324,6 +324,7 @@ remote!(test_mineru(config:sag_protocol::mineru::MineruConfig,key:String) => Tes
 remote!(clear_mineru_key(config:sag_protocol::mineru::MineruConfig) => ClearMineruKey);
 remote!(runtime_schema() => RuntimeSchema);
 remote!(test_model(kind:String,config:ModelConfig,key:String) => TestModel);
+remote!(list_models(config:ModelConfig,key:String) => ListModels);
 remote!(test_mcp(server:McpServer,credentials:Option<McpCredentials>) => TestMcp);
 remote!(resolve_tool_approval(id:String,allow:bool) => ResolveToolApproval);
 remote!(list_conversations() => ListConversations);
@@ -663,6 +664,7 @@ pub fn run() {
             uninstall_docling,
             save_settings,
             test_model,
+            list_models,
             runtime_schema,
             mineru_schema,
             test_mineru,

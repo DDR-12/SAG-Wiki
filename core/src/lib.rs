@@ -1,4 +1,5 @@
 mod conversion;
+mod llm;
 mod mineru;
 pub mod agent;
 pub mod anydoc;

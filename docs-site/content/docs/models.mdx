@@ -20,9 +20,9 @@ description: "配置回答模型、Jev 与 MinerU 文档解析，并验证连接
 
 ### 供应商
 
-选择供应商后会填入对应接口地址。问答模型提供 OpenAI、DeepSeek、GLM、OpenRouter、302.AI 和自定义；Jev 提供 Zleap、302.AI、OpenRouter、Typesafe 和自定义。首次启动默认选择 Zleap；已有用户的服务地址和模型配置保持不变。
+选择供应商后会填入对应接口地址。问答模型提供 OpenAI、Anthropic、Google Gemini、DeepSeek、通义千问、智谱、Moonshot、硅基流动、OpenRouter、Ollama、302.AI 和自定义 OpenAI 兼容端点。Jev 提供 Zleap、302.AI、OpenRouter、Typesafe 和自定义。首次启动默认选择 Zleap；已有用户的服务地址和模型配置保持不变。Jev 判断接口与聊天接口不同，不能把上述聊天供应商直接当作 Jev。
 
-问答接口和 Jev 判断接口是两类接口，不能只因供应商相同就互换地址。自定义服务必须兼容对应接口。
+问答接口和 Jev 判断接口是两类接口，不能只因供应商相同就互换地址。自定义服务必须兼容对应接口。Anthropic 官方接口用于拉取模型列表和测试连接；当前问答与工具调用仍使用 OpenAI Chat Completions。要在问答里使用 Claude，请选择 OpenRouter，或把自定义地址指向兼容该协议的网关。Gemini 的默认地址是官方 OpenAI 兼容端点，模型列表和连接测试走 Gemini 自己的接口。Ollama 的模型列表来自 `/api/tags`，问答使用同一服务的 `/v1` 兼容接口，本地通常不需要密钥。
 
 ### 接口地址
 
@@ -41,7 +41,7 @@ Jev 可填写基础地址（如 `http://127.0.0.1:8000/v1`），也可填写完�
 
 ### 可选模型与模型名称
 
-问答模型的 **可选模型 · 每行一个** 决定界面里可以切换哪些模型。每行填写一个服务支持的准确模型 ID，不加逗号；去重后保存。连接测试使用列表第一项。
+填写 API 密钥和接口地址后，应用会按供应商接口拉取模型列表：OpenAI 兼容服务使用 `GET /models`，Anthropic 使用 `GET /v1/models`，Gemini 使用 `GET /v1beta/models`，Ollama 使用 `GET /api/tags`。拉取成功后，结果出现在 **模型** 下拉框中。拉取失败时，下拉框改用内置预设，并保留 **手工输入模型 · 每行一个**。每行一个准确模型 ID，不加逗号；去重后保存。连接测试使用当前选中的模型。
 
 Jev 的 **模型名称** 填写一个 Jev 模型 ID。首次默认使用 Zleap 开放平台的 `Zev-1`，基础地址为 `https://api.zleap.com/v1`，实际请求 `/v1/systemone`，使用 API Key 鉴权。参见[决策模型文档](https://platform.zleap.com/docs/decision)。切换供应商后，请核对模型名称是否受该服务支持。
 
@@ -49,7 +49,7 @@ Jev 的 **模型名称** 填写一个 Jev 模型 ID。首次默认使用 Zleap �
 
 选择 Zleap 时，点击 **获取 API Key** 打开[开放平台控制台](https://platform.zleap.com/console)，创建并填写该平台的密钥。Zleap 决策模型与 302.AI 问答模型的密钥分别配置。
 
-粘贴对应服务的密钥。输入框默认隐藏，可点击显示或隐藏；已保存时留空会保留原密钥。“移除保存的密钥”会立即删除对应密钥。
+粘贴对应服务的密钥。输入框始终以掩码显示，界面不提供明文回显；已保存的密钥显示为 `已保存 · ••••••••`，留空会保留原密钥。“移除保存的密钥”会立即删除对应密钥。密钥只写入本机应用数据目录里的 `credentials.json`，不会写入设置 JSON、日志或错误提示。
 
 两类服务都选择 302.AI 时，填写一个密钥可以自动填入尚未配置的另一项。保存前仍需确认两项服务与密钥都正确。
 

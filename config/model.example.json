@@ -1,0 +1,18 @@
+{
+  "answer": {
+    "provider": "openai",
+    "url": "https://api.openai.com/v1",
+    "model": "gpt-4o-mini",
+    "models": ["gpt-4o-mini"],
+    "auth_mode": "bearer",
+    "has_key": false
+  },
+  "jev": {
+    "provider": "302",
+    "url": "https://api.302ai.cn/typesafeai/v1",
+    "model": "jev-latest",
+    "models": [],
+    "auth_mode": "bearer",
+    "has_key": false
+  }
+}
