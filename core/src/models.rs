@@ -44,6 +44,13 @@ fn write_credentials(
         .map_err(|e| e.error)?;
     Ok(())
 }
+pub fn answer_secret(dir: &std::path::Path, config: &ModelConfig) -> Result<String> {
+    if config.auth_mode == ModelAuthMode::None && crate::llm::allows_missing_key(config) {
+        Ok(String::new())
+    } else {
+        secret(dir, "answer")
+    }
+}
 pub fn secret(dir: &std::path::Path, kind: &str) -> Result<String> {
     credentials(dir)?.remove(kind).context(if kind == "jev" {
         "请在设置中填写 Jev API 密钥"
@@ -117,8 +124,14 @@ pub fn endpoint(config: &ModelConfig, jev: bool) -> String {
     let path = url.path().trim_end_matches('/');
     let complete = if jev { path.ends_with("/decisions") || path.ends_with("/systemone") }
         else { path.ends_with("/chat/completions") || path.ends_with("/responses") };
-    let path = if complete { path.to_owned() }
-        else { format!("{path}/{}", if jev { "systemone" } else { "chat/completions" }) };
+    let path = if complete {
+        path.to_owned()
+    } else if !jev && crate::llm::request_style(config) == "ollama" {
+        let base = if path.ends_with("/v1") { path.to_string() } else { format!("{path}/v1") };
+        format!("{base}/chat/completions")
+    } else {
+        format!("{path}/{}", if jev { "systemone" } else { "chat/completions" })
+    };
     url.set_path(&path);
     url.into()
 }
@@ -837,6 +850,9 @@ pub async fn test_connection(
         return Ok("连接成功".into());
     }
     let key = if kind == "jev" && config.auth_mode == ModelAuthMode::None { "" } else { key };
+    if kind != "jev" && crate::llm::uses_native_api(config) {
+        return crate::llm::test_native(client, config, key, timeout).await;
+    }
     let cancel = CancellationToken::new();
     let payload = if kind == "jev" {
         json!({"model":config.model,"state":"Connection test","questions":{"test":{"type":"noul","instructions":{"question":"Is this a connection test?"},"criteria":{"true":"It is a connection test.","false":"It is not a connection test."}}}})

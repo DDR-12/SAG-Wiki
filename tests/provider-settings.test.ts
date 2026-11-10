@@ -46,7 +46,7 @@ it('302 密钥入口打开指定网页，切换供应商后隐藏',async()=>{
  await choose('answer','openai');expect(link()).toBeNull();
  expect(card('jev').querySelector('.settings-key-link')).not.toBeNull();
 });
-it('LLM 六个供应商自动填入地址，自定义地址与模型列表可以保存',async()=>{
+it('LLM 供应商自动填入默认地址，自定义地址与模型列表可以保存',async()=>{
  const onSave=await setup();
  for(const provider of providers.answer.filter(provider=>provider.value!=='custom')){await choose('answer',provider.value);expect(address('answer').value).toBe(provider.value==='302'?value.answer.url:provider.url);}
  await choose('answer','custom');await input(address('answer'),'https://proxy.example/v1');await save();
@@ -81,7 +81,7 @@ it('供应商切换不会将已保存或已输入的另一家密钥用于测试�
  const settings=structuredClone(value);settings.answer.has_key=true;const onSave=await setup(settings);
  await choose('answer','openai');expect(key('answer').placeholder).toBe('填写 API 密钥');
  card('answer').querySelector<HTMLButtonElement>('.settings-model-test')!.click();
- await vi.waitFor(()=>expect(document.body.textContent).toContain('切换供应商后，请填写对应的 API 密钥。'));expect(api.mock.calls.filter(([command])=>!['mineru_schema','runtime_schema'].includes(command))).toHaveLength(0);
+ await vi.waitFor(()=>expect(document.body.textContent).toContain('切换供应商后，请填写对应的 API 密钥。'));expect(api.mock.calls.filter(([command])=>!['mineru_schema','runtime_schema','list_models'].includes(command))).toHaveLength(0);
  await save();expect(onSave).not.toHaveBeenCalled();
  await input(key('answer'),'test-openai-key');await choose('answer','302');expect(key('answer').value).toBe('');
  await choose('answer','openai');await input(key('answer'),'test-new-key');api.mockResolvedValue('连接成功');
@@ -153,6 +153,71 @@ it('无需鉴权会丢弃草稿密钥，也不接收 302 自动共享的密钥',
  await save();expect(onSave.mock.calls[0][2]).toBe('');
  await chooseAuth('bearer');expect(key('jev').value).toBe('');
 });
+
+it('填写密钥后把供应商返回的模型放进下拉框，失败时退回预设并保留手工输入',async()=>{
+ const onSave=await setup();
+ await choose('answer','openai');
+ api.mockImplementation(async(command:string)=>{
+  if(command==='list_models')return ['remote-alpha','remote-beta'];
+  if(command==='test_model')return '连接成功';
+  return '{}';
+ });
+ await input(key('answer'),'test-openai-key');
+ await vi.waitFor(()=>expect(document.querySelector('.model-list-notice')?.textContent).toContain('已从供应商获取 2 个模型'));
+ const modelTrigger=card('answer').querySelector<HTMLButtonElement>('.answer-model-field button')!;
+ modelTrigger.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true}));
+ await vi.waitFor(()=>expect(document.querySelector('[role=option][data-value="remote-beta"]')).not.toBeNull());
+ document.querySelector('[role=option][data-value="remote-beta"]')!.dispatchEvent(new PointerEvent('pointerup',{bubbles:true,pointerType:'mouse'}));
+ await tick();
+ expect(card('answer').querySelector('textarea')!.value).toContain('remote-beta');
+ api.mockImplementation(async(command:string)=>{
+  if(command==='list_models')throw new Error('模型请求失败（HTTP 503）：test-openai-key-2');
+  return '{}';
+ });
+ await input(key('answer'),'test-openai-key-2');
+ await vi.waitFor(()=>expect(document.querySelector('.model-list-notice')?.getAttribute('data-source')).toBe('preset'));
+ expect(document.body.textContent).toContain('无法获取模型列表，已改用内置预设');
+ expect(document.body.textContent).not.toContain('test-openai-key-2');
+ expect(document.body.textContent).toContain('[已隐藏]');
+ modelTrigger.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true}));
+ await vi.waitFor(()=>expect(document.querySelector('[role=option][data-value="gpt-4o"]')).not.toBeNull());
+ const manual=card('answer').querySelector('textarea')!;
+ manual.value='hand-written-model';manual.dispatchEvent(new Event('input',{bubbles:true}));await tick();
+ await save();
+ expect(onSave.mock.calls.at(-1)[0].answer.models).toContain('hand-written-model');
+ expect(onSave.mock.calls.at(-1)[0].answer.provider).toBe('openai');
+});
+it('测试连接会显示成功和失败，密钥输入框保持掩码且没有明文开关',async()=>{
+ await setup();
+ await choose('answer','deepseek');
+ expect(card('answer').querySelector('.key-field button')).toBeNull();
+ expect(key('answer').type).toBe('password');
+ await input(key('answer'),'test-visible-secret');
+ expect(card('answer').textContent).not.toContain('test-visible-secret');
+ api.mockImplementation(async(command:string)=>{
+  if(command==='test_model')return '连接成功';
+  if(command==='list_models')return ['deepseek-chat'];
+  return '{}';
+ });
+ card('answer').querySelector<HTMLButtonElement>('.settings-model-test')!.click();
+ await vi.waitFor(()=>expect(document.body.textContent).toContain('连接成功'));
+ api.mockImplementation(async(command:string)=>{
+  if(command==='test_model')throw new Error('模型请求失败（HTTP 401）：test-visible-secret');
+  if(command==='list_models')return ['deepseek-chat'];
+  return '{}';
+ });
+ card('answer').querySelector<HTMLButtonElement>('.settings-model-test')!.click();
+ await vi.waitFor(()=>expect(document.body.textContent).toContain('连接失败'));
+ expect(document.body.textContent).not.toContain('test-visible-secret');
+ expect(document.body.textContent).toContain('[已隐藏]');
+});
+it('已保存的密钥用掩码占位，不会把密钥写回界面',async()=>{
+ const settings=structuredClone(value);settings.answer.has_key=true;
+ await setup(settings);
+ expect(key('answer').value).toBe('');
+ expect(key('answer').placeholder).toBe('已保存 · ••••••••');
+ expect(key('answer').type).toBe('password');
+});
 it('切回 API Key 后仍禁止复用原供应商的保存密钥',async()=>{
  const settings=structuredClone(value);settings.jev.has_key=true;const onSave=await setup(settings);
  await chooseAuth('none');await choose('jev','custom');await input(address('jev'),'http://127.0.0.1:8000/v1');
@@ -160,7 +225,7 @@ it('切回 API Key 后仍禁止复用原供应商的保存密钥',async()=>{
  expect(key('jev').placeholder).toBe('填写 API 密钥');
  card('jev').querySelector<HTMLButtonElement>('.settings-model-test')!.click();
  await vi.waitFor(()=>expect(document.body.textContent).toContain('切换供应商后，请填写对应的 API 密钥。'));
- expect(api.mock.calls.filter(([command])=>!['mineru_schema','runtime_schema'].includes(command))).toHaveLength(0);await save();expect(onSave).not.toHaveBeenCalled();
+ expect(api.mock.calls.filter(([command])=>!['mineru_schema','runtime_schema','list_models'].includes(command))).toHaveLength(0);await save();expect(onSave).not.toHaveBeenCalled();
 });
 
 it('切换到 Zleap 自动填写 Zev-1，测试和保存使用新模型',async()=>{
