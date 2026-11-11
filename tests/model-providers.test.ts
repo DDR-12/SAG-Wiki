@@ -63,7 +63,8 @@ it('封闭供应商会换掉不在列表中的模型，OpenRouter 和自定义�
  expect(alignAnswerModel('anthropic', 'gpt-4o-mini', ['gpt-4o-mini'], presetsFor('anthropic'))).toEqual({model: 'claude-sonnet-4-5', models: ['claude-sonnet-4-5']});
  expect(alignAnswerModel('openai', 'gpt-4o', ['gpt-4o', 'gpt-4o-mini'], presetsFor('openai')).model).toBe('gpt-4o');
  expect(alignAnswerModel('custom', 'gpt-4o-mini', ['gpt-4o-mini'], [])).toEqual({model: 'gpt-4o-mini', models: ['gpt-4o-mini']});
- expect(alignAnswerModel('openrouter', 'my-router-model', ['my-router-model'], presetsFor('openrouter')).model).toBe('my-router-model');
+ expect(alignAnswerModel('openrouter', 'gpt-4o-mini', ['gpt-4o-mini'], presetsFor('openrouter'))).toEqual({model: 'openai/gpt-4o-mini', models: ['openai/gpt-4o-mini']});
+ expect(alignAnswerModel('openrouter', 'anthropic/claude-sonnet-4.5', ['anthropic/claude-sonnet-4.5'], presetsFor('openrouter')).model).toBe('anthropic/claude-sonnet-4.5');
  expect(alignAnswerModel('ollama', '', [], [])).toEqual({model: '', models: []});
 });
 
@@ -71,6 +72,9 @@ it('不带版本的 Anthropic 地址会补上 /v1', () => {
  expect(normalizeAnswerUrl('anthropic', 'https://api.anthropic.com')).toBe('https://api.anthropic.com/v1');
  expect(normalizeAnswerUrl('anthropic', 'https://api.anthropic.com/')).toBe('https://api.anthropic.com/v1');
  expect(normalizeAnswerUrl('anthropic', 'https://api.anthropic.com/v1')).toBe('https://api.anthropic.com/v1');
+ expect(normalizeAnswerUrl('anthropic', 'https://proxy.example/v1')).toBe('https://proxy.example/v1');
+ expect(normalizeAnswerUrl('custom', 'https://gateway.example.com')).toBe('https://gateway.example.com');
+ expect(migrateModelConfig({provider: 'anthropic', url: 'https://anthropic-proxy.example/v1', model: 'claude-sonnet-4-5'}, 'answer').config.url).toBe('https://anthropic-proxy.example/v1');
  const migrated = migrateModelConfig({provider: 'anthropic', url: 'https://api.anthropic.com', model: 'claude-sonnet-4-5'}, 'answer');
  expect(migrated.config.url).toBe('https://api.anthropic.com/v1');
  expect(migrated.config.model).toBe('claude-sonnet-4-5');

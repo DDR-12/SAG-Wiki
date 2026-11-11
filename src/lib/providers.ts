@@ -47,13 +47,20 @@ export function sameProviderOrigin(a: string, b: string): boolean {
  try { return new URL(a).origin === new URL(b).origin; } catch { return false; }
 }
 
-/** OpenRouter 和自定义端点接受任意模型 ID，切换时不改已填的名称。 */
-export const freeFormAnswerProviders = new Set(['custom', 'openrouter']);
+/** 自定义端点接受任意模型 ID。OpenRouter 只接受带「厂商/模型」前缀的 ID。 */
+export const freeFormAnswerProviders = new Set(['custom']);
 
 export function alignAnswerModel(provider: string, current: string, manual: string[], known: string[]): {model: string; models: string[]} {
  const selected = current.trim();
  const lines = unique(manual);
- if (freeFormAnswerProviders.has(provider)) return {model: selected, models: lines.length ? lines : (selected ? [selected] : [])};
+ if (provider === 'custom') return {model: selected, models: lines.length ? lines : (selected ? [selected] : [])};
+ if (provider === 'openrouter') {
+  const fallback = known.find(item => item.includes('/')) ?? known[0] ?? '';
+  const next = selected.includes('/') ? selected : fallback;
+  const kept = lines.filter(item => item.includes('/'));
+  if (next && !kept.includes(next)) kept.unshift(next);
+  return {model: next, models: unique(kept)};
+ }
  const allowed = unique(known);
  const next = selected && allowed.includes(selected) ? selected : (allowed[0] ?? '');
  const kept = lines.filter(item => allowed.includes(item));

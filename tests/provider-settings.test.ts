@@ -209,14 +209,38 @@ it('切换到封闭供应商时重置不兼容的模型，保存也不会留下�
  expect(saved[0].answer.model).toBe('claude-sonnet-4-5');
  expect(saved[0].answer.models).not.toContain('gpt-4o-mini');
 });
-it('切换到 OpenRouter 或自定义时保留已经填写的模型名',async()=>{
+it('切换到 OpenRouter 时不带厂商前缀的模型会换成预设，自定义端点仍保留原名',async()=>{
  const settings=structuredClone(value);
  settings.answer={...settings.answer,provider:'openai',url:'https://api.openai.com/v1',model:'gpt-4o-mini',models:['gpt-4o-mini']};
- await setup(settings);
- await choose('answer','openrouter');
- expect(card('answer').querySelector('.answer-model-field button')!.textContent).toContain('gpt-4o-mini');
+ const onSave=await setup(settings);
  await choose('answer','custom');
- expect(card('answer').querySelector('.answer-model-field button')!.textContent).toContain('gpt-4o-mini');
+ expect(card('answer').querySelector('textarea')!.value.trim()).toBe('gpt-4o-mini');
+ await choose('answer','openrouter');
+ expect(card('answer').querySelector('textarea')!.value.trim()).toBe('openai/gpt-4o-mini');
+ expect(card('answer').querySelector('.answer-model-field button')!.textContent).toContain('openai/gpt-4o-mini');
+ await save();
+ const routed=onSave.mock.calls.at(-1);
+ if(!routed) throw new Error('保存没有被调用');
+ expect(routed[0].answer.model).toBe('openai/gpt-4o-mini');
+ expect(routed[0].answer.models).not.toContain('gpt-4o-mini');
+});
+it('不切换直接保存，预设外的模型保持不变',async()=>{
+ const cases=[
+  {provider:'302' as const,url:'https://api.302.ai/v1',model:'gpt-4o',models:['gpt-4o','claude-sonnet-4-5'],has_key:true},
+  {provider:'ollama' as const,url:'http://127.0.0.1:11434/v1',model:'mistral:7b',models:['mistral:7b'],has_key:false},
+  {provider:'openai' as const,url:'https://api.openai.com/v1',model:'ft:gpt-4o-mini:org::abc',models:['ft:gpt-4o-mini:org::abc'],has_key:true},
+ ];
+ for(const answer of cases){
+  const settings=structuredClone(value);
+  settings.answer={...settings.answer,...answer};
+  const onSave=await setup(settings);
+  await save();
+  const saved=onSave.mock.calls.at(-1);
+  if(!saved) throw new Error('保存没有被调用');
+  expect(saved[0].answer.model).toBe(answer.model);
+  expect(saved[0].answer.models).toEqual(answer.models);
+  await unmount(app!);app=undefined;document.body.innerHTML='';
+ }
 });
 it('输入密钥时不拉列表，失焦后才请求',async()=>{
  await setup();
