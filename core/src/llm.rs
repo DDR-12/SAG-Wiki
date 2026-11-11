@@ -170,7 +170,28 @@ fn migrate_model(kind: &str, value: &mut Value, changed: &mut bool) -> Option<St
         object.insert("provider".into(), Value::String(infer_provider(kind, url)));
         *changed = true;
     }
+    let provider = object.get("provider").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+    let url = object.get("url").and_then(Value::as_str).unwrap_or("").to_owned();
+    if let Some(next) = normalize_provider_url(&provider, &url) {
+        object.insert("url".into(), Value::String(next));
+        *changed = true;
+    }
     key.filter(|value| !value.is_empty())
+}
+
+fn normalize_provider_url(provider: &str, url: &str) -> Option<String> {
+    if provider != "anthropic" && !provider.is_empty() {
+        return None;
+    }
+    let Ok(mut parsed) = reqwest::Url::parse(url.trim()) else { return None };
+    if parsed.host_str() != Some("api.anthropic.com") { return None; }
+    let path = parsed.path().trim_matches('/');
+    if !path.is_empty() { return None; }
+    parsed.set_path("/v1");
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    let next = parsed.to_string();
+    (next != url.trim()).then_some(next)
 }
 
 fn move_alias(object: &mut serde_json::Map<String, Value>, canonical: &str, aliases: &[&str]) -> bool {
@@ -492,6 +513,15 @@ mod tests {
         assert!(value["jev"].get("key").is_none());
         assert!(!value.to_string().contains("legacy-answer-key"));
         assert!(!value.to_string().contains("legacy-jev-key"));
+        let mut anthropic = json!({"answer": {"provider": "anthropic", "url": "https://api.anthropic.com", "model": "claude-sonnet-4-5", "models": ["claude-sonnet-4-5"]}});
+        assert!(migrate_settings_value(&mut anthropic).changed);
+        assert_eq!(anthropic["answer"]["url"], "https://api.anthropic.com/v1");
+        assert_eq!(anthropic["answer"]["model"], "claude-sonnet-4-5");
+        assert!(!migrate_settings_value(&mut anthropic).changed);
+        let mut rooted = json!({"answer": {"url": "https://api.anthropic.com/", "model": "claude-sonnet-4-5"}});
+        assert!(migrate_settings_value(&mut rooted).changed);
+        assert_eq!(rooted["answer"]["url"], "https://api.anthropic.com/v1");
+        assert_eq!(rooted["answer"]["provider"], "anthropic");
         let again = migrate_settings_value(&mut value);
         assert!(!again.changed);
         assert!(again.answer.is_none() && again.jev.is_none());

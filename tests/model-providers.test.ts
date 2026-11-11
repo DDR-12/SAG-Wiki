@@ -1,6 +1,6 @@
 import {readFileSync} from 'node:fs';
 import {expect, it} from 'vitest';
-import {llmProviders, maskKey, migrateModelConfig, modelChoices, presetsFor, providerFor, redactSecret} from '../src/lib/providers';
+import {alignAnswerModel, llmProviders, maskKey, migrateModelConfig, modelChoices, normalizeAnswerUrl, presetsFor, providerFor, redactSecret} from '../src/lib/providers';
 
 const required = [
  ['openai', 'https://api.openai.com/v1'],
@@ -57,6 +57,23 @@ it('旧模型配置迁移保留字段并抽出密钥', () => {
  });
  expect(migrated.config).not.toHaveProperty('api_key');
  expect(JSON.stringify(migrated.config)).not.toContain('legacy-key');
+});
+
+it('封闭供应商会换掉不在列表中的模型，OpenRouter 和自定义保留原名', () => {
+ expect(alignAnswerModel('anthropic', 'gpt-4o-mini', ['gpt-4o-mini'], presetsFor('anthropic'))).toEqual({model: 'claude-sonnet-4-5', models: ['claude-sonnet-4-5']});
+ expect(alignAnswerModel('openai', 'gpt-4o', ['gpt-4o', 'gpt-4o-mini'], presetsFor('openai')).model).toBe('gpt-4o');
+ expect(alignAnswerModel('custom', 'gpt-4o-mini', ['gpt-4o-mini'], [])).toEqual({model: 'gpt-4o-mini', models: ['gpt-4o-mini']});
+ expect(alignAnswerModel('openrouter', 'my-router-model', ['my-router-model'], presetsFor('openrouter')).model).toBe('my-router-model');
+ expect(alignAnswerModel('ollama', '', [], [])).toEqual({model: '', models: []});
+});
+
+it('不带版本的 Anthropic 地址会补上 /v1', () => {
+ expect(normalizeAnswerUrl('anthropic', 'https://api.anthropic.com')).toBe('https://api.anthropic.com/v1');
+ expect(normalizeAnswerUrl('anthropic', 'https://api.anthropic.com/')).toBe('https://api.anthropic.com/v1');
+ expect(normalizeAnswerUrl('anthropic', 'https://api.anthropic.com/v1')).toBe('https://api.anthropic.com/v1');
+ const migrated = migrateModelConfig({provider: 'anthropic', url: 'https://api.anthropic.com', model: 'claude-sonnet-4-5'}, 'answer');
+ expect(migrated.config.url).toBe('https://api.anthropic.com/v1');
+ expect(migrated.config.model).toBe('claude-sonnet-4-5');
 });
 
 it('密钥掩码和错误脱敏不回显原文', () => {

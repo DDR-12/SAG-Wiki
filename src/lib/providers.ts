@@ -47,6 +47,20 @@ export function sameProviderOrigin(a: string, b: string): boolean {
  try { return new URL(a).origin === new URL(b).origin; } catch { return false; }
 }
 
+/** OpenRouter 和自定义端点接受任意模型 ID，切换时不改已填的名称。 */
+export const freeFormAnswerProviders = new Set(['custom', 'openrouter']);
+
+export function alignAnswerModel(provider: string, current: string, manual: string[], known: string[]): {model: string; models: string[]} {
+ const selected = current.trim();
+ const lines = unique(manual);
+ if (freeFormAnswerProviders.has(provider)) return {model: selected, models: lines.length ? lines : (selected ? [selected] : [])};
+ const allowed = unique(known);
+ const next = selected && allowed.includes(selected) ? selected : (allowed[0] ?? '');
+ const kept = lines.filter(item => allowed.includes(item));
+ if (next && !kept.includes(next)) kept.unshift(next);
+ return {model: next, models: unique(kept)};
+}
+
 export function modelChoices(provider: string, remote: string[] | null, manual: string[]): {source: 'remote' | 'preset'; models: string[]} {
  const extra = manual.map(item => item.trim()).filter(Boolean);
  if (remote && remote.length) return {source: 'remote', models: unique([...remote, ...extra])};
@@ -99,8 +113,26 @@ export function migrateModelConfig(raw: Record<string, unknown> | undefined, kin
   source.provider = typeof source.vendor === 'string' && source.vendor.trim() ? source.vendor : providerFor(kind, String(source.url ?? ''));
  }
  delete source.vendor;
+ if (typeof source.url === 'string') {
+  const normalized = normalizeAnswerUrl(String(source.provider ?? ''), source.url);
+  if (normalized !== source.url) source.url = normalized;
+ }
  if (key) source.has_key = true;
  return {config: source, key: key || undefined};
+}
+
+export function normalizeAnswerUrl(provider: string, url: string): string {
+ const trimmed = url.trim();
+ let parsed: URL;
+ try { parsed = new URL(trimmed); } catch { return trimmed; }
+ if (parsed.hostname !== 'api.anthropic.com') return trimmed;
+ const path = parsed.pathname.replace(/\/+$/, '');
+ if (path !== '' && path !== '/') return trimmed;
+ if (provider !== 'anthropic' && provider !== '') return trimmed;
+ parsed.pathname = '/v1';
+ parsed.search = '';
+ parsed.hash = '';
+ return parsed.toString();
 }
 
 function unique(values: string[]): string[] {
