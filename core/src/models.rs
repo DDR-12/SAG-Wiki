@@ -1108,12 +1108,24 @@ mod tests {
     #[test]
     fn provider_urls() {
         let mut c = ModelConfig::default();
+        assert_eq!(c.provider, "302");
         assert_eq!(
             endpoint(&c, false),
             "https://api.302ai.cn/v1/chat/completions"
         );
         c.url = "https://example.com/api/alpha/decisions".into();
         assert_eq!(endpoint(&c, true), c.url);
+    }
+    #[test]
+    fn anthropic_answer_requests_the_compatible_chat_completions_url() {
+        let config = ModelConfig {
+            provider: "anthropic".into(),
+            url: crate::llm::provider("anthropic").unwrap().base_url.clone(),
+            model: "claude-sonnet-4-5".into(),
+            ..Default::default()
+        };
+        assert_eq!(config.url, "https://api.anthropic.com/v1");
+        assert_eq!(endpoint(&config, false), "https://api.anthropic.com/v1/chat/completions");
     }
     #[test]
     fn local_jev_urls_preserve_complete_endpoints_and_query_parameters() {

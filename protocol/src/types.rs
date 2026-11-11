@@ -179,7 +179,7 @@ pub struct ModelConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
-            provider: String::new(),
+            provider: "302".into(),
             url: "https://api.302ai.cn/v1".into(),
             model: "qwen3.6-flash".into(),
             models: vec!["qwen3.6-flash".into()],

@@ -163,6 +163,8 @@ it('填写密钥后把供应商返回的模型放进下拉框，失败时退回�
   return '{}';
  });
  await input(key('answer'),'test-openai-key');
+ expect(api.mock.calls.some(([command])=>command==='list_models')).toBe(false);
+ card('answer').querySelector<HTMLButtonElement>('.settings-model-list')!.click();
  await vi.waitFor(()=>expect(document.querySelector('.model-list-notice')?.textContent).toContain('已从供应商获取 2 个模型'));
  const modelTrigger=card('answer').querySelector<HTMLButtonElement>('.answer-model-field button')!;
  modelTrigger.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true}));
@@ -175,6 +177,7 @@ it('填写密钥后把供应商返回的模型放进下拉框，失败时退回�
   return '{}';
  });
  await input(key('answer'),'test-openai-key-2');
+ card('answer').querySelector<HTMLButtonElement>('.settings-model-list')!.click();
  await vi.waitFor(()=>expect(document.querySelector('.model-list-notice')?.getAttribute('data-source')).toBe('preset'));
  expect(document.body.textContent).toContain('无法获取模型列表，已改用内置预设');
  expect(document.body.textContent).not.toContain('test-openai-key-2');
@@ -184,8 +187,10 @@ it('填写密钥后把供应商返回的模型放进下拉框，失败时退回�
  const manual=card('answer').querySelector('textarea')!;
  manual.value='hand-written-model';manual.dispatchEvent(new Event('input',{bubbles:true}));await tick();
  await save();
- expect(onSave.mock.calls.at(-1)[0].answer.models).toContain('hand-written-model');
- expect(onSave.mock.calls.at(-1)[0].answer.provider).toBe('openai');
+ const savedCall=onSave.mock.calls.at(-1);
+ if(!savedCall) throw new Error('保存没有被调用');
+ expect(savedCall[0].answer.models).toContain('hand-written-model');
+ expect(savedCall[0].answer.provider).toBe('openai');
 });
 it('测试连接会显示成功和失败，密钥输入框保持掩码且没有明文开关',async()=>{
  await setup();
