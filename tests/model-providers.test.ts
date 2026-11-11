@@ -4,7 +4,7 @@ import {llmProviders, maskKey, migrateModelConfig, modelChoices, presetsFor, pro
 
 const required = [
  ['openai', 'https://api.openai.com/v1'],
- ['anthropic', 'https://api.anthropic.com'],
+ ['anthropic', 'https://api.anthropic.com/v1'],
  ['gemini', 'https://generativelanguage.googleapis.com/v1beta/openai'],
  ['deepseek', 'https://api.deepseek.com'],
  ['dashscope', 'https://dashscope.aliyuncs.com/compatible-mode/v1'],
