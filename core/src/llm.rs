@@ -96,7 +96,8 @@ pub fn allows_missing_key(config: &ModelConfig) -> bool {
 }
 
 pub fn uses_native_api(config: &ModelConfig) -> bool {
-    matches!(request_style(config).as_str(), "anthropic" | "gemini" | "ollama")
+    // Anthropic 的连接测试走问答实际使用的 Chat Completions，不走 Messages API。
+    matches!(request_style(config).as_str(), "gemini" | "ollama")
 }
 
 pub fn redact_secret(message: &str, key: &str) -> String {
@@ -411,7 +412,7 @@ mod tests {
     fn catalog_covers_the_required_providers_and_default_urls() {
         let expected = [
             ("openai", "https://api.openai.com/v1", "openai"),
-            ("anthropic", "https://api.anthropic.com", "anthropic"),
+            ("anthropic", "https://api.anthropic.com/v1", "anthropic"),
             ("gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "gemini"),
             ("deepseek", "https://api.deepseek.com", "openai"),
             ("dashscope", "https://dashscope.aliyuncs.com/compatible-mode/v1", "openai"),

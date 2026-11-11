@@ -11,7 +11,7 @@
     {
       "id": "anthropic",
       "label": "Anthropic",
-      "base_url": "https://api.anthropic.com",
+      "base_url": "https://api.anthropic.com/v1",
       "api": "anthropic",
       "hosts": ["api.anthropic.com"],
       "presets": ["claude-sonnet-4-5", "claude-opus-4-1", "claude-haiku-4-5"]
