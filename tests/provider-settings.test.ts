@@ -49,7 +49,8 @@ it('302 密钥入口打开指定网页，切换供应商后隐藏',async()=>{
 it('LLM 供应商自动填入默认地址，自定义地址与模型列表可以保存',async()=>{
  const onSave=await setup();
  for(const provider of providers.answer.filter(provider=>provider.value!=='custom')){await choose('answer',provider.value);expect(address('answer').value).toBe(provider.value==='302'?value.answer.url:provider.url);}
- await choose('answer','custom');await input(address('answer'),'https://proxy.example/v1');await save();
+ await choose('answer','custom');await input(address('answer'),'https://proxy.example/v1');
+ const manual=card('answer').querySelector('textarea')!;manual.value='first\nsecond';manual.dispatchEvent(new Event('input',{bubbles:true}));await tick();await save();
  expect(onSave.mock.calls[0][0].answer).toMatchObject({url:'https://proxy.example/v1',model:'first',models:['first','second']});
 });
 it('Jev 预设供应商填入对应评分接口，并提供自定义选项',async()=>{
@@ -191,6 +192,40 @@ it('填写密钥后把供应商返回的模型放进下拉框，失败时退回�
  if(!savedCall) throw new Error('保存没有被调用');
  expect(savedCall[0].answer.models).toContain('hand-written-model');
  expect(savedCall[0].answer.provider).toBe('openai');
+});
+it('切换到封闭供应商时重置不兼容的模型，保存也不会留下旧模型名',async()=>{
+ const settings=structuredClone(value);
+ settings.answer={...settings.answer,provider:'openai',url:'https://api.openai.com/v1',model:'gpt-4o-mini',models:['gpt-4o-mini']};
+ const onSave=await setup(settings);
+ expect(card('answer').querySelector('.answer-model-field button')!.textContent).toContain('gpt-4o-mini');
+ await choose('answer','anthropic');
+ expect(address('answer').value).toBe('https://api.anthropic.com/v1');
+ expect(card('answer').querySelector('.answer-model-field button')!.textContent).toContain('claude-sonnet-4-5');
+ expect(card('answer').querySelector('textarea')!.value).not.toContain('gpt-4o-mini');
+ await save();
+ const saved=onSave.mock.calls.at(-1);
+ if(!saved) throw new Error('保存没有被调用');
+ expect(saved[0].answer.provider).toBe('anthropic');
+ expect(saved[0].answer.model).toBe('claude-sonnet-4-5');
+ expect(saved[0].answer.models).not.toContain('gpt-4o-mini');
+});
+it('切换到 OpenRouter 或自定义时保留已经填写的模型名',async()=>{
+ const settings=structuredClone(value);
+ settings.answer={...settings.answer,provider:'openai',url:'https://api.openai.com/v1',model:'gpt-4o-mini',models:['gpt-4o-mini']};
+ await setup(settings);
+ await choose('answer','openrouter');
+ expect(card('answer').querySelector('.answer-model-field button')!.textContent).toContain('gpt-4o-mini');
+ await choose('answer','custom');
+ expect(card('answer').querySelector('.answer-model-field button')!.textContent).toContain('gpt-4o-mini');
+});
+it('输入密钥时不拉列表，失焦后才请求',async()=>{
+ await setup();
+ await choose('answer','openai');
+ api.mockImplementation(async(command:string)=>{if(command==='list_models')return ['remote-alpha'];return '{}';});
+ await input(key('answer'),'test-openai-key');
+ expect(api.mock.calls.filter(([command])=>command==='list_models')).toHaveLength(0);
+ key('answer').dispatchEvent(new FocusEvent('blur',{bubbles:true}));
+ await vi.waitFor(()=>expect(api).toHaveBeenCalledWith('list_models',expect.objectContaining({key:'test-openai-key'})));
 });
 it('测试连接会显示成功和失败，密钥输入框保持掩码且没有明文开关',async()=>{
  await setup();
