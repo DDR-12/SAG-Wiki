@@ -522,6 +522,10 @@ mod tests {
         assert!(migrate_settings_value(&mut rooted).changed);
         assert_eq!(rooted["answer"]["url"], "https://api.anthropic.com/v1");
         assert_eq!(rooted["answer"]["provider"], "anthropic");
+        let mut proxy = json!({"answer": {"provider": "anthropic", "url": "https://proxy.example/v1", "model": "claude-sonnet-4-5"}});
+        assert!(!migrate_settings_value(&mut proxy).changed || proxy["answer"]["url"] == "https://proxy.example/v1");
+        assert_eq!(proxy["answer"]["url"], "https://proxy.example/v1");
+        assert_eq!(normalize_provider_url("anthropic", "https://gateway.internal/anthropic"), None);
         let again = migrate_settings_value(&mut value);
         assert!(!again.changed);
         assert!(again.answer.is_none() && again.jev.is_none());
