@@ -415,7 +415,7 @@ fn save_settings(
         ("answer", &old.answer, &settings.answer, &answer_key),
         ("jev", &old.jev, &settings.jev, &jev_key),
     ] {
-        if kind == "jev" && next.auth_mode == ModelAuthMode::None { continue; }
+        if next.auth_mode == ModelAuthMode::None && (kind == "jev" || crate::llm::allows_missing_key(next)) { continue; }
         models::check_key_provider(
             previous,
             next,
@@ -562,10 +562,12 @@ async fn test_model(
     if kind != "answer" && kind != "jev" {
         return Err("模型类型不正确".into());
     }
-    if kind == "answer" && config.auth_mode != ModelAuthMode::Bearer {
+    if kind == "answer" && config.auth_mode != ModelAuthMode::Bearer && !crate::llm::allows_missing_key(&config) {
         return Err("问答模型需要 API Key 鉴权；无需鉴权选项仅适用于 Jev".into());
     }
-    let key = if kind == "jev" && config.auth_mode == ModelAuthMode::None {
+    let key = if (kind == "jev" && config.auth_mode == ModelAuthMode::None)
+        || (kind == "answer" && key.trim().is_empty() && crate::llm::allows_missing_key(&config))
+    {
         String::new()
     } else if key.trim().is_empty() {
         let saved = state.store.settings().map_err(error)?;
@@ -594,6 +596,20 @@ async fn test_model(
     )
     .await
     .map_err(error)
+}
+async fn list_models(config: ModelConfig, key: String, state: &Arc<Service>) -> CommandResult<Vec<String>> {
+    let key = if key.trim().is_empty() && crate::llm::allows_missing_key(&config) {
+        String::new()
+    } else if key.trim().is_empty() {
+        let saved = state.store.settings().map_err(error)?;
+        models::check_key_provider(&saved.answer, &config, &key, models::has_secret(&state.data_dir, "answer").map_err(error)?).map_err(error)?;
+        models::secret(&state.data_dir, "answer").map_err(error)?
+    } else {
+        key
+    };
+    crate::llm::list_models(&state.client, &config, &key, state.store.settings().map_err(error)?.timeout_secs)
+        .await
+        .map_err(|failure| crate::llm::redact_secret(&failure.to_string(), &key))
 }
 fn list_conversations(state: &Arc<Service>) -> CommandResult<Vec<Conversation>> {
     state.store.conversations().map_err(error)
@@ -656,7 +672,7 @@ async fn summarize_search(
         let mut config = settings.answer.clone();
         config.reasoning_effort = settings.model_profiles.get(&config.model)
             .and_then(|profile| profile.reasoning_effort);
-        let key = models::secret(&state.data_dir, "answer")?;
+        let key = models::answer_secret(&state.data_dir, &config)?;
         let plan = models::prepare_search_summary(
             &config, &question, results, settings.answer_context_tokens,
             settings.answer_output_tokens.min(settings.answer_context_tokens / 4),
@@ -822,7 +838,7 @@ async fn execute_query(
                 );
             };
         if let Some(c) = &mut conversation {
-            let answer_key = models::secret(&state.data_dir, "answer")?;
+            let answer_key = models::answer_secret(&state.data_dir, &settings.answer)?;
             let profile = settings
                 .model_profiles
                 .get(&q.model)
@@ -1432,6 +1448,7 @@ impl Service {
             Op::TestModel { kind, config, key } => {
                 Out::Text(test_model(kind, config, key, self).await?)
             }
+            Op::ListModels { config, key } => Out::Strings(list_models(config, key, self).await?),
             Op::TestMcp {
                 server,
                 credentials,

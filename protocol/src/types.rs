@@ -165,6 +165,9 @@ pub enum ModelAuthMode {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelConfig {
+    /// Provider id from the model catalog. Empty values are inferred from `url`.
+    #[serde(default)]
+    pub provider: String,
     pub url: String,
     pub model: String,
     pub models: Vec<String>,
@@ -176,6 +179,7 @@ pub struct ModelConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
+            provider: "302".into(),
             url: "https://api.302ai.cn/v1".into(),
             model: "qwen3.6-flash".into(),
             models: vec!["qwen3.6-flash".into()],
@@ -312,8 +316,9 @@ impl Default for Settings {
             credential_error: None,
             answer: ModelConfig::default(),
             jev: ModelConfig {
-                url: "https://api.302ai.cn/typesafeai/v1".into(),
-                model: "jev-latest".into(),
+                provider: "zleap".into(),
+                url: "https://api.zleap.com/v1".into(),
+                model: "Zev-1".into(),
                 models: vec![],
                 has_key: false,
                 auth_mode: ModelAuthMode::Bearer,

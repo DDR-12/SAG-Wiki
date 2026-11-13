@@ -1,0 +1,101 @@
+{
+  "providers": [
+    {
+      "id": "openai",
+      "label": "OpenAI",
+      "base_url": "https://api.openai.com/v1",
+      "api": "openai",
+      "hosts": ["api.openai.com"],
+      "presets": ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "o4-mini"]
+    },
+    {
+      "id": "anthropic",
+      "label": "Anthropic",
+      "base_url": "https://api.anthropic.com/v1",
+      "api": "anthropic",
+      "hosts": ["api.anthropic.com"],
+      "presets": ["claude-sonnet-4-5", "claude-opus-4-1", "claude-haiku-4-5"]
+    },
+    {
+      "id": "gemini",
+      "label": "Google Gemini",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "api": "gemini",
+      "hosts": ["generativelanguage.googleapis.com"],
+      "presets": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+    },
+    {
+      "id": "deepseek",
+      "label": "DeepSeek",
+      "base_url": "https://api.deepseek.com",
+      "api": "openai",
+      "hosts": ["api.deepseek.com"],
+      "presets": ["deepseek-chat", "deepseek-reasoner"]
+    },
+    {
+      "id": "dashscope",
+      "label": "通义千问",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "api": "openai",
+      "hosts": ["dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com", "dashscope-us.aliyuncs.com"],
+      "presets": ["qwen-plus", "qwen-turbo", "qwen-max"]
+    },
+    {
+      "id": "glm",
+      "label": "智谱",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "api": "openai",
+      "hosts": ["open.bigmodel.cn"],
+      "presets": ["glm-4.5", "glm-4.5-air", "glm-4-flash"]
+    },
+    {
+      "id": "moonshot",
+      "label": "Moonshot",
+      "base_url": "https://api.moonshot.cn/v1",
+      "api": "openai",
+      "hosts": ["api.moonshot.cn"],
+      "presets": ["moonshot-v1-auto", "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"]
+    },
+    {
+      "id": "siliconflow",
+      "label": "硅基流动",
+      "base_url": "https://api.siliconflow.cn/v1",
+      "api": "openai",
+      "hosts": ["api.siliconflow.cn"],
+      "presets": ["deepseek-ai/DeepSeek-V3", "Qwen/Qwen2.5-72B-Instruct"]
+    },
+    {
+      "id": "openrouter",
+      "label": "OpenRouter",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api": "openai",
+      "hosts": ["openrouter.ai"],
+      "presets": ["openai/gpt-4o-mini", "anthropic/claude-sonnet-4.5"]
+    },
+    {
+      "id": "ollama",
+      "label": "Ollama",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "api": "ollama",
+      "hosts": ["127.0.0.1", "localhost"],
+      "match_port": 11434,
+      "presets": ["llama3.2", "qwen2.5", "deepseek-r1"]
+    },
+    {
+      "id": "302",
+      "label": "302.AI",
+      "base_url": "https://api.302ai.cn/v1",
+      "api": "openai",
+      "hosts": ["api.302.ai", "api.302ai.cn"],
+      "presets": ["qwen3.6-flash"]
+    },
+    {
+      "id": "custom",
+      "label": "自定义",
+      "base_url": "",
+      "api": "openai",
+      "hosts": [],
+      "presets": []
+    }
+  ]
+}

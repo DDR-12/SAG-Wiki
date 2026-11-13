@@ -31,6 +31,13 @@ fn write_credentials(
         .map_err(|e| e.error)?;
     Ok(())
 }
+pub fn answer_secret(dir: &std::path::Path, config: &ModelConfig) -> Result<String> {
+    if config.auth_mode == ModelAuthMode::None && crate::llm::allows_missing_key(config) {
+        Ok(String::new())
+    } else {
+        secret(dir, "answer")
+    }
+}
 pub fn secret(dir: &std::path::Path, kind: &str) -> Result<String> {
     credentials(dir)?.remove(kind).context(if kind == "jev" {
         "请在设置中填写 Jev API 密钥"
@@ -104,8 +111,14 @@ pub fn endpoint(config: &ModelConfig, jev: bool) -> String {
     let path = url.path().trim_end_matches('/');
     let complete = if jev { path.ends_with("/decisions") || path.ends_with("/systemone") }
         else { path.ends_with("/chat/completions") };
-    let path = if complete { path.to_owned() }
-        else { format!("{path}/{}", if jev { "systemone" } else { "chat/completions" }) };
+    let path = if complete {
+        path.to_owned()
+    } else if !jev && crate::llm::request_style(config) == "ollama" {
+        let base = if path.ends_with("/v1") { path.to_string() } else { format!("{path}/v1") };
+        format!("{base}/chat/completions")
+    } else {
+        format!("{path}/{}", if jev { "systemone" } else { "chat/completions" })
+    };
     url.set_path(&path);
     url.into()
 }
@@ -745,11 +758,14 @@ pub async fn test_connection(
     timeout: u64,
 ) -> Result<String> {
     let key = if kind == "jev" && config.auth_mode == ModelAuthMode::None { "" } else { key };
+    if kind != "jev" && crate::llm::uses_native_api(config) {
+        return crate::llm::test_native(client, config, key, timeout).await;
+    }
     let cancel = CancellationToken::new();
     let payload = if kind == "jev" {
         json!({"model":config.model,"state":"Connection test","questions":{"test":{"type":"noul","instructions":{"question":"Is this a connection test?"},"criteria":{"true":"It is a connection test.","false":"It is not a connection test."}}}})
     } else {
-        json!({"model":config.model,"messages":[{"role":"user","content":"Reply with OK."}],"max_tokens":8})
+        json!({"model":config.model,"messages":[{"role":"user","content":"Reply with OK."}]})
     };
     let data: Value = request(
         client,
@@ -1000,12 +1016,24 @@ mod tests {
     #[test]
     fn provider_urls() {
         let mut c = ModelConfig::default();
+        assert_eq!(c.provider, "302");
         assert_eq!(
             endpoint(&c, false),
             "https://api.302ai.cn/v1/chat/completions"
         );
         c.url = "https://example.com/api/alpha/decisions".into();
         assert_eq!(endpoint(&c, true), c.url);
+    }
+    #[test]
+    fn anthropic_answer_requests_the_compatible_chat_completions_url() {
+        let config = ModelConfig {
+            provider: "anthropic".into(),
+            url: crate::llm::provider("anthropic").unwrap().base_url.clone(),
+            model: "claude-sonnet-4-5".into(),
+            ..Default::default()
+        };
+        assert_eq!(config.url, "https://api.anthropic.com/v1");
+        assert_eq!(endpoint(&config, false), "https://api.anthropic.com/v1/chat/completions");
     }
     #[test]
     fn local_jev_urls_preserve_complete_endpoints_and_query_parameters() {
@@ -1228,6 +1256,56 @@ mod transport_tests {
     }
     fn http(kind: &str, body: &str) -> String {
         format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len())
+    }
+    #[tokio::test]
+    async fn answer_connection_omits_provider_specific_token_limits() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = ModelConfig {
+            url: format!("http://{}/v1", listener.local_addr().unwrap()),
+            model: "gpt-6.1-terra".into(),
+            ..Default::default()
+        };
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut bytes = vec![];
+            let mut part = [0; 4096];
+            let (headers, payload): (String, Value) = loop {
+                let count = socket.read(&mut part).unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&part[..count]);
+                if let Some(end) = bytes.windows(4).position(|p| p == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                    let length = headers.lines().find_map(|line| {
+                        line.to_ascii_lowercase().strip_prefix("content-length: ")
+                            .and_then(|n| n.parse::<usize>().ok())
+                    }).unwrap();
+                    if bytes.len() >= end + 4 + length {
+                        break (
+                            headers.into_owned(),
+                            serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap(),
+                        );
+                    }
+                }
+            };
+            let response = if payload.get("max_tokens").is_some() {
+                http("application/json", r#"{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.","type":"invalid_request_error","param":"max_tokens","code":"unsupported_parameter"}}"#)
+                    .replacen("200 OK", "400 Bad Request", 1)
+            } else {
+                http("application/json", r#"{"choices":[{"message":{"content":"OK"}}]}"#)
+            };
+            socket.write_all(response.as_bytes()).unwrap();
+            (headers, payload)
+        });
+        let client = Client::builder().no_proxy().build().unwrap();
+        let result = test_connection(&client, "answer", &config, "test-only", 5).await;
+        assert_eq!(result.unwrap(), "连接成功");
+        let (headers, sent) = server.join().unwrap();
+        assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        assert_eq!(sent["model"], "gpt-6.1-terra");
+        assert_eq!(sent["messages"], json!([{"role":"user","content":"Reply with OK."}]));
+        assert!(sent.get("max_tokens").is_none());
+        assert!(sent.get("max_completion_tokens").is_none());
     }
     #[tokio::test]
     async fn compressed_provider_errors_keep_the_original_reason() {

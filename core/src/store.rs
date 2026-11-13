@@ -284,6 +284,8 @@ impl Store {
  CREATE TABLE IF NOT EXISTS index_issues(path TEXT PRIMARY KEY,root TEXT NOT NULL REFERENCES roots(path) ON DELETE CASCADE,error TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS index_history(id INTEGER PRIMARY KEY AUTOINCREMENT,path TEXT NOT NULL,name TEXT NOT NULL,started_at INTEGER NOT NULL,finished_at INTEGER NOT NULL,completed INTEGER NOT NULL,total INTEGER NOT NULL,status TEXT NOT NULL,error TEXT);
  CREATE TABLE IF NOT EXISTS conversions(source TEXT PRIMARY KEY,root TEXT NOT NULL REFERENCES roots(path) ON DELETE CASCADE,source_hash TEXT NOT NULL,output TEXT NOT NULL,output_hash TEXT NOT NULL,valid INTEGER NOT NULL DEFAULT 1);
+ CREATE TABLE IF NOT EXISTS conversion_failures(source TEXT PRIMARY KEY,root TEXT NOT NULL REFERENCES roots(path) ON DELETE CASCADE,source_hash TEXT NOT NULL,error TEXT NOT NULL,mtime INTEGER,size INTEGER);
+ CREATE INDEX IF NOT EXISTS conversion_failures_root ON conversion_failures(root);
  CREATE INDEX IF NOT EXISTS conversions_output ON conversions(output);
  CREATE INDEX IF NOT EXISTS index_issues_root ON index_issues(root);
  CREATE TABLE IF NOT EXISTS documents(id INTEGER PRIMARY KEY AUTOINCREMENT,root TEXT NOT NULL,path TEXT UNIQUE NOT NULL,name TEXT NOT NULL,hash TEXT NOT NULL,mtime INTEGER NOT NULL,size INTEGER NOT NULL DEFAULT 0);
@@ -312,6 +314,13 @@ impl Store {
         )?;
         if !has_file_log {
             db.execute("ALTER TABLE index_history ADD COLUMN file_log TEXT", [])?;
+        }
+        let has_conversion_mtime: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('conversions') WHERE name='mtime')",
+            [], |r| r.get(0),
+        )?;
+        if !has_conversion_mtime {
+            db.execute_batch("ALTER TABLE conversions ADD COLUMN mtime INTEGER; ALTER TABLE conversions ADD COLUMN size INTEGER;")?;
         }
         if !has_size {
             db.execute(
@@ -385,7 +394,9 @@ impl Store {
             text_preparation: PreparationBudget::new(TEXT_PREPARATION_BUDGET),
         };
         if let Some(saved) = saved {
-            let previous: Settings = serde_json::from_str(&saved)?;
+            let mut parsed: serde_json::Value = serde_json::from_str(&saved)?;
+            crate::llm::migrate_settings_value(&mut parsed);
+            let previous: Settings = serde_json::from_value(parsed)?;
             if previous.retrieval_version < crate::sag2_v10::VERSION {
                 let updated = store.settings()?;
                 if previous.retrieval.chunk_chars != updated.retrieval.chunk_chars {
@@ -423,7 +434,9 @@ impl Store {
             .optional()?;
         let mut settings = match value {
             Some(v) => {
-                let mut settings: Settings = serde_json::from_str(&v)?;
+                let mut parsed: serde_json::Value = serde_json::from_str(&v).context("设置格式无效")?;
+                let secrets = crate::llm::migrate_settings_value(&mut parsed);
+                let mut settings: Settings = serde_json::from_value(parsed.clone()).context("设置格式无效")?;
                 if settings.retrieval_version < crate::sag2_v10::VERSION {
                     let r = &settings.retrieval;
                     if r.candidate_k == 50 && r.seed_k == 10 && r.max_hops == 1 && r.expansion_term_limit == 20 && r.top_k == 10 && r.chunk_chars == 1000 {
@@ -432,16 +445,36 @@ impl Store {
                     settings.retrieval.max_hops = settings.retrieval.max_hops.min(2);
                     settings.retrieval_version = crate::sag2_v10::VERSION;
                 }
+                if secrets.changed {
+                    self.persist_model_migration(&parsed, &secrets)?;
+                }
                 settings
             },
             None => Settings::default(),
         };
+        crate::llm::normalize_provider("answer", &mut settings.answer);
+        crate::llm::normalize_provider("jev", &mut settings.jev);
         settings.mineru.enabled = crate::mineru::has_key(self.docling.data_directory(), &settings.mineru)?;
         Ok(settings)
     }
+    fn persist_model_migration(&self, parsed: &serde_json::Value, secrets: &crate::llm::MigratedSecrets) -> Result<()> {
+        let directory = self.docling.data_directory();
+        for (kind, key) in [("answer", &secrets.answer), ("jev", &secrets.jev)] {
+            if let Some(key) = key {
+                if !crate::models::has_secret(directory, kind)? {
+                    crate::models::save_secret(directory, kind, key)?;
+                }
+            }
+        }
+        self.connection().execute(
+            "INSERT INTO preferences VALUES(1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value",
+            [parsed.to_string()],
+        )?;
+        Ok(())
+    }
     pub fn validate_settings(s: &Settings) -> Result<()> {
         s.runtime.validate().map_err(anyhow::Error::msg)?;
-        if s.answer.auth_mode != ModelAuthMode::Bearer {
+        if s.answer.auth_mode != ModelAuthMode::Bearer && !crate::llm::allows_missing_key(&s.answer) {
             bail!("问答模型需要 API Key 鉴权；无需鉴权选项仅适用于 Jev")
         }
         anyhow::ensure!(s.search_summary_sources > 0, "自动问答参考数量必须大于 0");
@@ -698,6 +731,7 @@ impl Store {
                 params![value, r.path],
             )?;
             tx.execute("UPDATE index_issues SET root=? WHERE root=?", params![value, r.path])?;
+            tx.execute("UPDATE conversion_failures SET root=? WHERE root=?", params![value, r.path])?;
             tx.execute("UPDATE root_exclusions SET root=? WHERE root=?", params![value, r.path])?;
             tx.execute("DELETE FROM roots WHERE path=?", [&r.path])?;
         }
@@ -1142,6 +1176,7 @@ impl Store {
         tx.execute("DELETE FROM chunk_fts WHERE rowid IN (SELECT c.id FROM chunks c JOIN documents d ON d.id=c.document_id WHERE d.root=?1 AND (d.path=?2 OR instr(d.path,?3)=1))", params![root,path,prefix])?;
         let removed = tx.execute("DELETE FROM documents WHERE root=?1 AND (path=?2 OR instr(path,?3)=1)", params![root,path,prefix])?;
         tx.execute("DELETE FROM index_issues WHERE root=?1 AND (path=?2 OR instr(path,?3)=1)", params![root,path,prefix])?;
+        tx.execute("DELETE FROM conversion_failures WHERE root=?1 AND (source=?2 OR instr(source,?3)=1)", params![root,path,prefix])?;
         Self::mark_note_sources_removed_tx(tx, &path, true)?;
         if removed > 0 { tx.execute("UPDATE metadata SET version=version+1", [])?; }
         Ok(removed)
@@ -1209,6 +1244,12 @@ impl Store {
         Ok((files, convert))
     }
     fn convert_sources(&self, root: &str, directory: &Path, sources: &[PathBuf], settings: &Settings, progress: &impl Fn(IndexProgress)) -> Result<Vec<(String,String)>> {
+        /// The stored source hash for a content hash (or a previously stored
+        /// hash, whose last segment is the content hash) under this identity.
+        fn hash_for_identity(hash: &str, identity: &str) -> String {
+            let content = hash.rsplit(':').next().unwrap_or(hash);
+            if identity.is_empty() { content.into() } else { format!("{identity}:{content}") }
+        }
         let workers = settings.conversion_workers;
         let mut issues = vec![];
         let mut rules = crate::folder_index::Rules::new(Path::new(root), settings)?;
@@ -1254,6 +1295,19 @@ impl Store {
             self.connection().execute("DELETE FROM conversions WHERE source=?", [&source])?;
             self.remove_indexed(&output)?;
         }
+        let stale_failures: Vec<String> = {
+            let db = self.connection();
+            let scope = path_text(directory)?;
+            let prefix = format!("{}{}", scope.trim_end_matches(std::path::MAIN_SEPARATOR), std::path::MAIN_SEPARATOR);
+            let mut query = db.prepare("SELECT source FROM conversion_failures WHERE root=?1 AND (source=?2 OR instr(source,?3)=1)")?;
+            let rows = query.query_map(params![root,scope,prefix], |row| row.get::<_, String>(0))?
+                .filter(|row| row.as_ref().is_ok_and(|source| !sources_set.contains(source)))
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for source in stale_failures {
+            self.connection().execute("DELETE FROM conversion_failures WHERE source=?", [&source])?;
+        }
         if !sources.is_empty() {
             self.indexing.phase(root, "converting", sources.len());
             progress(IndexProgress { count: 0, total: sources.len() });
@@ -1275,15 +1329,57 @@ impl Store {
                         let mut converted = false;
                         let mut previous_usable = false;
                         let mut unchanged_previous = None;
+                        let mut hashed = None;
+                        let mut stat = None;
                         let result = (|| -> Result<bool> {
                             let output = crate::docling::output_path(Path::new(root), source)?;
-                            let source_content_hash = crate::docling::fingerprint(source)?;
+                            let metadata = fs::metadata(source)?;
+                            let mtime = metadata.modified()?.duration_since(UNIX_EPOCH)?.as_nanos() as i64;
+                            let size = metadata.len() as i64;
+                            stat = Some((mtime, size));
                             let identity=crate::conversion::identity(source,settings);
-                            let source_hash = if identity.is_empty(){source_content_hash.clone()}else{format!("{identity}:{source_content_hash}")};
-                            let previous: Option<(String,String,bool)> = self.connection().query_row(
-                                "SELECT source_hash,output_hash,valid FROM conversions WHERE source=?", [&source_text],
-                                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
-                            if let Some((previous_source, previous_output, valid)) = &previous {
+                            let previous: Option<(String,String,bool,Option<i64>,Option<i64>)> = self.connection().query_row(
+                                "SELECT source_hash,output_hash,valid,mtime,size FROM conversions WHERE source=?", [&source_text],
+                                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional()?;
+                            // Like text files, an unchanged mtime and size stand in for the
+                            // content hash so a routine scan does not read every source again.
+                            if let Some((previous_source, _, true, Some(previous_mtime), Some(previous_size))) = &previous {
+                                if *previous_mtime == mtime && *previous_size == size && output.exists()
+                                    && hash_for_identity(previous_source, &identity) == *previous_source {
+                                    hashed = Some(previous_source.clone());
+                                    return Ok(true);
+                                }
+                            }
+                            // A source that failed only for a missing component fails the same
+                            // way until the component is installed or the file changes; do not
+                            // parse it again on every scan.
+                            let remembered = |hash: Option<&str>| -> Result<Option<String>> {
+                                Ok(match hash {
+                                    Some(hash) => self.connection().query_row(
+                                        "SELECT error FROM conversion_failures WHERE source=?1 AND source_hash=?2", params![&source_text, hash],
+                                        |row| row.get(0)).optional()?,
+                                    None => self.connection().query_row(
+                                        "SELECT source_hash,error FROM conversion_failures WHERE source=?1 AND mtime=?2 AND size=?3", params![&source_text, mtime, size],
+                                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).optional()?
+                                        .filter(|(hash, _)| hash_for_identity(hash, &identity) == *hash)
+                                        .map(|(_, error)| error),
+                                })
+                            };
+                            let component_missing = || !self.docling.has_profile(crate::docling::required_profile(source));
+                            if let Some(error) = remembered(None)? {
+                                if component_missing() {
+                                    bail!("{error}")
+                                }
+                            }
+                            let source_content_hash = crate::docling::fingerprint(source)?;
+                            let source_hash = hash_for_identity(&source_content_hash, &identity);
+                            hashed = Some(source_hash.clone());
+                            if let Some(error) = remembered(Some(&source_hash))? {
+                                if component_missing() {
+                                    bail!("{error}")
+                                }
+                            }
+                            if let Some((previous_source, previous_output, valid, _, _)) = &previous {
                                 if output.exists() {
                                     let previous_content = previous_source.rsplit(':').next().unwrap_or(previous_source);
                                     if *valid && previous_content == source_content_hash {
@@ -1291,7 +1387,7 @@ impl Store {
                                     }
                                     previous_usable = *valid && crate::docling::fingerprint(&output)? == *previous_output;
                                     if previous_source == &source_hash {
-                                        self.connection().execute("UPDATE conversions SET valid=1 WHERE source=?", [&source_text])?;
+                                        self.connection().execute("UPDATE conversions SET valid=1,mtime=?2,size=?3 WHERE source=?1", params![&source_text, mtime, size])?;
                                         return Ok(true);
                                     }
                                     if crate::docling::fingerprint(&output)? != *previous_output {
@@ -1309,8 +1405,8 @@ impl Store {
                             // Pause between conversion and acceptance without retaining an
                             // "active file" entry or a database lock.
                             self.indexing.checkpoint_root(root)?;
-                            if let Err(error) = self.publish_converted_file(root, source, &source_hash, &source_content_hash, &output, staged,
-                                previous.as_ref().map(|(_, hash, _)| hash.as_str()), settings.retrieval.chunk_chars, &settings.runtime) {
+                            if let Err(error) = self.publish_converted_file(root, source, &source_hash, &source_content_hash, (mtime, size), &output, staged,
+                                previous.as_ref().map(|(_, hash, _, _, _)| hash.as_str()), settings.retrieval.chunk_chars, &settings.runtime) {
                                 // Keep successful history stages stable; add a failed entry
                                 // only when acceptance rejects an otherwise converted file.
                                 self.indexing.file(root, source, || Err::<(), _>(error))?;
@@ -1320,18 +1416,23 @@ impl Store {
                         let source_unchanged = unchanged_previous.as_ref().is_some_and(|hash|
                             crate::docling::fingerprint(source).is_ok_and(|current| &current == hash));
                         let preserve_previous = source_unchanged || previous_usable && result.as_ref().err().is_some_and(crate::conversion::resource_failure) || converted || result.as_ref().err().is_some_and(|error| error.is::<std::io::Error>());
-                        tx.send((source_text, result, preserve_previous))?;
+                        tx.send((source_text, result, preserve_previous, hashed, stat))?;
                     }
                     Ok(())
                 }));
             }
             drop(tx);
-            for (index, (source, result, preserve_previous)) in rx.into_iter().enumerate() {
+            for (index, (source, result, preserve_previous, hashed, stat)) in rx.into_iter().enumerate() {
                 if let Err(error) = result {
                     if preserve_previous && error.is::<rusqlite::Error>() { return Err(error); }
                     if !preserve_previous {
                         // Backend failure still invalidates evidence for the changed source.
                         self.connection().execute("UPDATE conversions SET valid=0 WHERE source=?", [&source])?;
+                    }
+                    if let Some(source_hash) = hashed.filter(|_| crate::conversion::component_missing(&error)) {
+                        let (mtime, size) = stat.unwrap();
+                        self.connection().execute("INSERT INTO conversion_failures(source,root,source_hash,error,mtime,size) VALUES(?,?,?,?,?,?) ON CONFLICT(source) DO UPDATE SET root=excluded.root,source_hash=excluded.source_hash,error=excluded.error,mtime=excluded.mtime,size=excluded.size",
+                            params![&source, root, source_hash, error.to_string(), mtime, size])?;
                     }
                     issues.push((source, error.to_string()));
                 } else if result.unwrap() {
@@ -1361,7 +1462,7 @@ impl Store {
         }
         Ok(issues)
     }
-    fn publish_converted_file(&self, root: &str, source: &Path, source_hash: &str, source_content_hash: &str, output: &Path,
+    fn publish_converted_file(&self, root: &str, source: &Path, source_hash: &str, source_content_hash: &str, source_stat: (i64, i64), output: &Path,
         staged: tempfile::TempPath, previous_hash: Option<&str>, max_chars: usize, runtime: &sag_protocol::runtime::RuntimeSettings) -> Result<()> {
         let reserved = preparation_reservation_with_runtime(&staged, &runtime);
         let permit = self.text_preparation.reserve_with_limit(reserved, runtime.text_preparation_mib * 1024 * 1024, || self.indexing.cancelled(root))?;
@@ -1388,9 +1489,10 @@ impl Store {
             let mut db = self.connection();
             let tx = db.transaction()?;
             Self::write_prepared(&tx, root, prepared)?;
-            tx.execute("INSERT INTO conversions(source,root,source_hash,output,output_hash) VALUES(?,?,?,?,?) ON CONFLICT(source) DO UPDATE SET root=excluded.root,source_hash=excluded.source_hash,output=excluded.output,output_hash=excluded.output_hash,valid=1",
-                params![path_text(source)?,root,source_hash,path_text(output)?,output_hash])?;
+            tx.execute("INSERT INTO conversions(source,root,source_hash,output,output_hash,mtime,size) VALUES(?,?,?,?,?,?,?) ON CONFLICT(source) DO UPDATE SET root=excluded.root,source_hash=excluded.source_hash,output=excluded.output,output_hash=excluded.output_hash,valid=1,mtime=excluded.mtime,size=excluded.size",
+                params![path_text(source)?,root,source_hash,path_text(output)?,output_hash,source_stat.0,source_stat.1])?;
             tx.execute("DELETE FROM index_issues WHERE path=?", [path_text(source)?])?;
+            tx.execute("DELETE FROM conversion_failures WHERE source=?", [path_text(source)?])?;
             if self.indexing.stopped() { bail!("索引已停止") }
             fs::rename(&staged, output)?;
             published = true;
@@ -1767,8 +1869,12 @@ impl Store {
         Ok(true)
     }
     pub fn verify_root(&self, root: &str) -> Result<()> {
-        self.connection()
-            .execute("UPDATE documents SET mtime=0 WHERE root=?", [root])?;
+        let mut db = self.connection();
+        let tx = db.transaction()?;
+        tx.execute("UPDATE documents SET mtime=0 WHERE root=?", [root])?;
+        tx.execute("UPDATE conversions SET mtime=NULL WHERE root=?", [root])?;
+        tx.execute("UPDATE conversion_failures SET mtime=NULL WHERE root=?", [root])?;
+        tx.commit()?;
         Ok(())
     }
     pub fn invalidate_index(&self) -> Result<()> {
@@ -2780,15 +2886,16 @@ while [ ! -f "$(dirname "$0")/release" ]; do sleep 0.02; done
     }
 
     #[test]
-    fn new_settings_use_302_jev_and_keep_saved_provider() {
+    fn new_settings_use_zleap_jev_and_keep_saved_provider() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.sqlite");
         let store = Store::open(&path).unwrap();
         let mut settings = store.settings().unwrap();
-        assert_eq!(settings.jev.url, "https://api.302ai.cn/typesafeai/v1");
-        assert_eq!(settings.jev.model, "jev-latest");
-        assert_eq!(crate::models::endpoint(&settings.jev, true), "https://api.302ai.cn/typesafeai/v1/systemone");
+        assert_eq!(settings.jev.url, "https://api.zleap.com/v1");
+        assert_eq!(settings.jev.model, "Zev-1");
+        assert_eq!(crate::models::endpoint(&settings.jev, true), "https://api.zleap.com/v1/systemone");
         assert!(!settings.jev.has_key);
+        assert_eq!(settings.jev.auth_mode, crate::types::ModelAuthMode::Bearer);
 
         settings.jev.url = "https://openrouter.ai/api/alpha/decisions".into();
         settings.jev.model = "typesafe/jev-1.13".into();
@@ -2879,6 +2986,54 @@ while [ ! -f "$(dirname "$0")/release" ]; do sleep 0.02; done
         assert_eq!(upgraded.search_files("Original", &[], 5).unwrap().len(), 1);
         drop(upgraded);
         assert_eq!(Store::open(&path).unwrap().chunk_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn legacy_model_config_migrates_without_dropping_settings_or_keeping_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.sqlite");
+        let store = Store::open(&path).unwrap();
+        let mut old = serde_json::to_value(Settings::default()).unwrap();
+        old["theme"] = serde_json::json!("dark");
+        old["retrieval"]["candidate_k"] = serde_json::json!(70);
+        old["model_profiles"] = serde_json::json!({"gpt-4o":{"system_prompt":"保留","sag2_enabled":true,"mcp_servers":[]}});
+        let answer = old["answer"].as_object_mut().unwrap();
+        answer.remove("url");
+        answer.remove("model");
+        answer.remove("provider");
+        answer.insert("base_url".into(), serde_json::json!("https://api.openai.com/v1"));
+        answer.insert("model_name".into(), serde_json::json!("gpt-4o"));
+        answer.insert("models".into(), serde_json::json!("gpt-4o, gpt-4o-mini"));
+        answer.insert("api_key".into(), serde_json::json!("legacy-answer-key"));
+        answer.insert("reasoning_effort".into(), serde_json::json!("low"));
+        old["jev"].as_object_mut().unwrap().remove("provider");
+        old["jev"]["url"] = serde_json::json!("https://scorer.example/decisions");
+        old["jev"]["model"] = serde_json::json!("custom-jev");
+        old["jev"]["key"] = serde_json::json!("legacy-jev-key");
+        store.connection().execute("INSERT INTO preferences VALUES(1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value", [old.to_string()]).unwrap();
+        let settings = store.settings().unwrap();
+        assert_eq!(settings.theme, "dark");
+        assert_eq!(settings.retrieval.candidate_k, 70);
+        assert_eq!(settings.model_profiles["gpt-4o"].system_prompt, "保留");
+        assert_eq!(settings.answer.url, "https://api.openai.com/v1");
+        assert_eq!(settings.answer.model, "gpt-4o");
+        assert_eq!(settings.answer.models, vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]);
+        assert_eq!(settings.answer.provider, "openai");
+        assert!(settings.answer.has_key);
+        assert_eq!(settings.answer.reasoning_effort, Some(crate::types::ReasoningEffort::Low));
+        assert_eq!(settings.jev.url, "https://scorer.example/decisions");
+        assert_eq!(settings.jev.model, "custom-jev");
+        assert_eq!(settings.jev.provider, "custom");
+        assert!(settings.jev.has_key);
+        let stored: String = store.connection().query_row("SELECT value FROM preferences WHERE id=1", [], |row| row.get(0)).unwrap();
+        assert!(!stored.contains("legacy-answer-key"));
+        assert!(!stored.contains("legacy-jev-key"));
+        assert!(!stored.contains("api_key"));
+        assert_eq!(crate::models::secret(dir.path(), "answer").unwrap(), "legacy-answer-key");
+        assert_eq!(crate::models::secret(dir.path(), "jev").unwrap(), "legacy-jev-key");
+        let again = store.settings().unwrap();
+        assert_eq!(again.answer.model, "gpt-4o");
+        assert_eq!(crate::models::secret(dir.path(), "answer").unwrap(), "legacy-answer-key");
     }
 
     #[test]

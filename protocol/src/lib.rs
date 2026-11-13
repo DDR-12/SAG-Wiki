@@ -299,6 +299,10 @@ pub enum Operation {
         config: ModelConfig,
         key: String,
     },
+    ListModels {
+        config: ModelConfig,
+        key: String,
+    },
     TestMcp {
         server: McpServer,
         credentials: Option<McpCredentials>,

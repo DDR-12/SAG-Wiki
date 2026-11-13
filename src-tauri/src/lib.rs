@@ -21,8 +21,10 @@ use tauri::{
     Emitter, Manager, State,
 };
 type CommandResult<T> = Result<T, String>;
+/// Render an error for the frontend with its full cause chain, so wrapped
+/// failures keep the underlying reason (for example the OS error of a spawn).
 fn error(e: impl std::fmt::Display) -> String {
-    e.to_string()
+    format!("{e:#}")
 }
 struct AppState<R: tauri::Runtime = tauri::Wry> {
     client: Mutex<Client>,
@@ -141,7 +143,7 @@ fn connect_on_startup(state: Arc<AppState>, fresh_library: bool) {
                     }
                 }
             }
-            Err(error) => eprintln!("启动时连接 SAG 服务失败：{error}"),
+            Err(error) => eprintln!("启动时连接 SAG 服务失败：{error:#}"),
         }
     });
 }
@@ -169,11 +171,11 @@ fn forward_events<R: tauri::Runtime>(state: Arc<AppState<R>>) -> tauri::async_ru
                                     reported = None;
                                     None
                                 }
-                                Err(error) => Some(error.to_string()),
+                                Err(error) => Some(format!("{error:#}")),
                             }
                         }
                         Ok(None) => continue,
-                        Err(error) => Some(format!("SAG 服务重连失败：{error}")),
+                        Err(error) => Some(format!("SAG 服务重连失败：{error:#}")),
                     };
                     if let Some(message) = failure {
                         if reported.as_deref() != Some(&message) {
@@ -194,7 +196,7 @@ fn forward_events<R: tauri::Runtime>(state: Arc<AppState<R>>) -> tauri::async_ru
                 emit(
                     &state.app,
                     "app-error",
-                    format!("无法恢复 SAG 状态：{error}"),
+                    format!("无法恢复 SAG 状态：{error:#}"),
                 );
                 continue;
             }
@@ -322,6 +324,7 @@ remote!(test_mineru(config:sag_protocol::mineru::MineruConfig,key:String) => Tes
 remote!(clear_mineru_key(config:sag_protocol::mineru::MineruConfig) => ClearMineruKey);
 remote!(runtime_schema() => RuntimeSchema);
 remote!(test_model(kind:String,config:ModelConfig,key:String) => TestModel);
+remote!(list_models(config:ModelConfig,key:String) => ListModels);
 remote!(test_mcp(server:McpServer,credentials:Option<McpCredentials>) => TestMcp);
 remote!(resolve_tool_approval(id:String,allow:bool) => ResolveToolApproval);
 remote!(list_conversations() => ListConversations);
@@ -405,6 +408,7 @@ fn open_about_link(target: &str) -> CommandResult<()> {
         "project" => "https://github.com/Zleap-AI/SAG-Wiki",
         "company" => "https://zleap.com",
         "docling" => "https://docling.ai/",
+        "zleap-console" => "https://platform.zleap.com/console",
         "302-api-keys" => "https://302.ai/api-keys/list",
         _ => return Err("未知的关于页面链接".into()),
     };
@@ -660,6 +664,7 @@ pub fn run() {
             uninstall_docling,
             save_settings,
             test_model,
+            list_models,
             runtime_schema,
             mineru_schema,
             test_mineru,
