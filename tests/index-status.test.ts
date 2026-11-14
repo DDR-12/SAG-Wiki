@@ -463,7 +463,7 @@ it('Windows 索引路径显示常规格式，打开历史文件仍使用原始�
   throw Error(command);
  });
  app=mount(IndexDetails,{target:document.body,props:{roots:[root],onClose:vi.fn(),onPauseChange:vi.fn()}});
- await vi.waitFor(()=>expect(document.querySelector('.index-current-files span')?.textContent).toBe(String.raw`D:\Documents\大模型算法备案\报告.pdf`));
+ await vi.waitFor(()=>expect(document.querySelector('.index-current-file-path')?.textContent).toBe(String.raw`D:\Documents\大模型算法备案\报告.pdf`));
  expect([...document.querySelectorAll('.index-root-path')].map(node=>[node.textContent,node.getAttribute('title')])).toEqual(Array(2).fill([String.raw`D:\Documents\大模型算法备案`,String.raw`D:\Documents\大模型算法备案`]));
  expect(document.querySelector('.index-issues-dialog')?.textContent).not.toContain('\\\\?\\');
  document.querySelector<HTMLButtonElement>('.index-history-toggle')!.click();
@@ -507,4 +507,117 @@ it('recovers changed stages and completion when progress events are missed',asyn
  app=mount(App,{target:document.body});await vi.waitFor(()=>expect(document.querySelector('.index-status-primary')?.textContent).toContain('正在转换文件'));
  task={...task,stage:'indexing_converted',completed:2};await vi.waitFor(()=>expect(document.querySelector('.index-status-primary')?.textContent).toContain('正在索引转换结果'),{timeout:2500});
  task=null;rootState='ready';await vi.waitFor(()=>expect(document.querySelector('.index-status-primary')).toBeNull(),{timeout:2500});
+});
+
+it('shows concurrent actual parsers, updates parser-only changes and clears them outside conversion',async()=>{
+ let task={path:'/notes',stage:'converting',completed:1,total:4,files:['/notes/a.pdf','/notes/b.docx'],conversions:[{path:'/notes/a.pdf',engine:'MinerU'},{path:'/notes/b.docx',engine:'anydoc'}]};
+ invoke.mockImplementation(async command=>{
+  if(command==='get_settings')return {theme:'light',start_page:'ask',editor_size:15,answer:{model:'test',models:['test']}};
+  if(command==='get_index_status')return {paused:false,tasks:[structuredClone(task)]};
+  if(command==='list_roots')return [{path:'/notes',name:'Notes',status:'indexing',count:1,error:null}];
+  return [];
+ });
+ app=mount(App,{target:document.body});
+ await vi.waitFor(()=>expect(document.querySelector('.index-status-parser')?.textContent).toBe('解析方式：MinerU、anydoc'));
+ document.querySelector<HTMLButtonElement>('[aria-label="查看索引详情"]')!.click();
+ await vi.waitFor(()=>expect(document.querySelector('.index-current-files')?.textContent).toContain('解析方式：MinerU'));
+ task={...task,conversions:[{path:'/notes/a.pdf',engine:'Docling'},{path:'/notes/b.docx',engine:'anydoc'}]};
+ listeners.get('data-changed')!({payload:null});
+ await vi.waitFor(()=>expect(document.querySelector('.index-status-parser')?.textContent).toBe('解析方式：anydoc、Docling'));
+ await vi.waitFor(()=>expect(document.querySelector('.index-current-files')?.textContent).toContain('解析方式：Docling'));
+ task={...task,stage:'indexing_converted',conversions:[]};
+ listeners.get('data-changed')!({payload:null});
+ await vi.waitFor(()=>expect(document.querySelector('.index-status-parser')).toBeNull());
+ expect(document.querySelector('.index-status-primary')?.textContent).toContain('正在索引转换结果');
+});
+
+it('shows English preparation and retry parser labels while keeping stage and count separate',async()=>{
+ let task={path:'/notes',stage:'converting',completed:0,total:4,files:['/notes/a.pdf'],conversions:[] as {path:string;engine:string}[]};
+ let paused=false;
+ invoke.mockImplementation(async command=>{
+  if(command==='get_settings')return {language:'en',theme:'dark',start_page:'ask',editor_size:15,answer:{model:'test',models:['test']}};
+  if(command==='get_index_status')return {paused,tasks:[structuredClone(task)]};
+  if(command==='list_roots')return [{path:'/notes',name:'Notes',status:'indexing',count:1,error:null}];
+  return [];
+ });
+ app=mount(App,{target:document.body});
+ await vi.waitFor(()=>expect(document.querySelector('.index-status-parser')?.textContent).toBe('Preparing conversion…'));
+ task={...task,stage:'retrying_conversion',conversions:[{path:'/notes/a.pdf',engine:'Docling'}]};
+ listeners.get('data-changed')!({payload:null});
+ await vi.waitFor(()=>expect(document.querySelector('.index-status-parser')?.textContent).toBe('Parser: Docling'));
+ expect(document.querySelector('.index-status-meta')?.textContent).toContain('Processed 0 / 4 files');
+ paused=true;
+ listeners.get('data-changed')!({payload:null});
+ await vi.waitFor(()=>expect(document.querySelector('.index-status-primary')?.textContent).toBe('SAG indexing paused'));
+ expect(document.querySelector('.index-status-parser')?.textContent).toBe('Parser: Docling');
+ task={...task,files:[],conversions:[]};
+ listeners.get('data-changed')!({payload:null});
+ await vi.waitFor(()=>expect(document.querySelector('.index-status-parser')).toBeNull());
+});
+
+
+it('keeps the same card across PDF parts and stale ready root snapshots',async()=>{
+ let task:any={path:'/notes',stage:'converting',completed:2,total:3,files:['/notes/long.pdf'],conversions:[{path:'/notes/long.pdf',engine:'MinerU',segment:{current:1,total:20,start_page:1,end_page:50}}]};
+ invoke.mockImplementation(async command=>{
+  if(command==='get_settings')return {language:'en',theme:'light',start_page:'ask',editor_size:15,answer:{model:'test',models:['test']}};
+  if(command==='get_index_status')return {paused:false,tasks:task?[structuredClone(task)]:[]};
+  if(command==='list_roots')return [{path:'/notes',name:'Notes',status:'ready',count:2,error:null}];
+  return [];
+ });
+ app=mount(App,{target:document.body});
+ await vi.waitFor(()=>expect(document.querySelector('.index-status-segment')?.textContent).toContain('part 1 / 20'));
+ const card=document.querySelector('.index-status-row');
+ task.conversions=[{path:'/notes/long.pdf',engine:'',segment:{current:8,total:20,start_page:351,end_page:400}}];
+ listeners.get('data-changed')!({payload:null});
+ await vi.waitFor(()=>expect(document.querySelector('.index-status-segment')?.textContent).toContain('part 8 / 20'));
+ expect(document.querySelector('.index-status-row')).toBe(card);
+ expect(document.querySelector('.index-status-pages')?.textContent).toBe('Pages 351–400');
+ expect(document.querySelector('.index-status-parser')?.textContent).toBe('Processing document parts…');
+ expect(document.querySelector('.index-status-meta')?.textContent).toContain('Processed 2 / 3 files');
+ document.querySelector<HTMLButtonElement>('[aria-label="View index details"]')?.click();
+ await vi.waitFor(()=>expect(document.querySelector('.index-file-segment')?.textContent).toContain('part 8 / 20'));
+ document.querySelector<HTMLButtonElement>('[aria-label="Close index details"]')?.click();
+ document.querySelector<HTMLButtonElement>('[aria-label="Hide indexing status"]')?.click();
+ task.conversions[0].segment.current=9;listeners.get('data-changed')!({payload:null});
+ await new Promise(resolve=>setTimeout(resolve,50));expect(document.querySelector('.index-status-row')).toBeNull();
+});
+
+it('ignores a ready snapshot that predates a newer index progress event',async()=>{
+ let pending=false,release:(()=>void)|undefined;
+ const gate=new Promise<void>(resolve=>release=resolve);
+ invoke.mockImplementation(async command=>{
+  if(command==='get_settings')return {theme:'light',start_page:'ask',editor_size:15,answer:{model:'test'}};
+  if(command==='get_index_status'){if(pending)await gate;return {paused:false,tasks:[]};}
+  if(command==='list_roots')return [{path:'/notes',name:'Notes',status:'ready',count:1,error:null}];
+  return [];
+ });
+ app=mount(App,{target:document.body});
+ await vi.waitFor(()=>expect(listeners.has('data-changed')).toBe(true));
+ await new Promise(resolve=>setTimeout(resolve,50));
+ pending=true;listeners.get('data-changed')!({payload:null});
+ await tick();
+ listeners.get('index-progress')!({payload:{path:'/notes',count:1,total:3,stage:'converting'}});
+ await tick();const card=document.querySelector('.index-status-row');expect(card).not.toBeNull();
+ // Keep a genuinely fresh task active; only the in-flight old response is empty.
+ invoke.mockImplementation(async command=>command==='get_index_status'?{paused:false,tasks:[{path:'/notes',stage:'converting',completed:1,total:3,files:['/notes/a.pdf']}]}:command==='list_roots'?[{path:'/notes',name:'Notes',status:'indexing',count:1,error:null}]:[]);
+ release!();await new Promise(resolve=>setTimeout(resolve,100));await tick();
+ expect(document.querySelector('.index-status-row')).toBe(card);
+ expect(document.querySelector('.index-status-meta')?.textContent).toContain('1 / 3');
+});
+
+
+it('does not mix another root PDF parts with the displayed root file progress',async()=>{
+ invoke.mockImplementation(async command=>{
+  if(command==='get_settings')return {theme:'light',start_page:'ask',editor_size:15,answer:{model:'test'}};
+  if(command==='get_index_status')return {paused:false,tasks:[
+   {path:'/text',stage:'indexing_native',completed:1,total:5,files:['/text/a.md']},
+   {path:'/pdf',stage:'converting',completed:2,total:3,files:['/pdf/long.pdf'],conversions:[{path:'/pdf/long.pdf',engine:'MinerU',segment:{current:8,total:20,start_page:351,end_page:400}}]}
+  ]};
+  if(command==='list_roots')return [{path:'/text',name:'Text',status:'indexing',count:1,error:null},{path:'/pdf',name:'PDF',status:'indexing',count:2,error:null}];
+  return [];
+ });
+ app=mount(App,{target:document.body});
+ await vi.waitFor(()=>expect(document.querySelector('.index-status-primary')?.textContent).toContain('正在索引文本'));
+ expect(document.querySelector('.index-status-meta')?.textContent).toContain('1 / 5');
+ expect(document.querySelector('.index-status-segment')).toBeNull();
 });

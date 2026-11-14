@@ -8,7 +8,10 @@ use anyhow::{bail, Context, Result};
 use sag_protocol::types::Settings;
 use std::{fs, path::Path, time::Instant};
 
+mod pdf_segments;
+
 pub struct Attempt {
+    pub segment: Option<sag_protocol::ConversionSegment>,
     pub phase: Option<String>,
     pub engine: String,
     pub elapsed_ms: u64,
@@ -56,10 +59,18 @@ fn run_engines(
         if cancel() {
             bail!("已停止转换，未发布输出")
         }
+        report(Attempt {
+            segment: None,
+            phase: Some("starting".into()),
+            engine: (*engine).into(),
+            elapsed_ms: 0,
+            error: None,
+        });
         let started = Instant::now();
         let result = convert(engine);
         let message = result.as_ref().err().map(|error| format!("{error:#}"));
         report(Attempt {
+            segment: None,
             phase: None,
             engine: (*engine).into(),
             elapsed_ms: started.elapsed().as_millis() as u64,
@@ -94,13 +105,29 @@ pub(crate) fn local_formats(formats:&Option<Vec<String>>,config:&sag_protocol::m
 }
 
 pub fn identity(source: &Path, settings: &Settings) -> String {
+    let base = engine_identity(source, settings);
+    if source
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+    {
+        format!(
+            "pdf-segments-v1:{}:{}:{base}",
+            crate::mineru::PDF_SEGMENT_PAGES,
+            crate::docling_component::VERSION
+        )
+    } else {
+        base
+    }
+}
+
+fn engine_identity(source: &Path, settings: &Settings) -> String {
     let local = if anydoc::handles(source) {
         anydoc::CACHE_VERSION
     } else {
         "docling-v1"
     };
     let cloud = if cloud_supports(source, &settings.mineru) {
-        settings.mineru.content_identity()
+        format!("{}:local-images-v2", settings.mineru.content_identity())
     } else {
         "local".into()
     };
@@ -123,7 +150,70 @@ pub fn convert(
     docling: &Docling,
     settings: &Settings,
     cancel: impl Fn() -> bool + Sync,
+    mut report: impl FnMut(Attempt),
+) -> Result<()> {
+    if cancel() {
+        bail!("已停止转换，未发布输出")
+    }
+    if fs::metadata(source)?.len() > settings.runtime.conversion_input_mib as u64 * 1024 * 1024 {
+        return Err(Failure::new(FailureKind::Memory, "文档超过配置的转换输入大小限制").into());
+    }
+    if source
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+    {
+        let limit = if cloud_supports(source, &settings.mineru) {
+            settings.mineru.provider.upload_limit_bytes()
+        } else {
+            settings.runtime.conversion_input_mib as u64 * 1024 * 1024
+        };
+        let parts =
+            match crate::mineru::prepare_pdf_segments(source, limit, &settings.runtime, &cancel) {
+                Ok(parts) => parts,
+                // Docling's alternate backend can repair PDFs rejected by lopdf.
+                // Preparation incompatibility must not bypass the parser chain.
+                Err(error) if error.chain().any(|cause| cause.is::<lopdf::Error>()) => {
+                    return convert_single(source, output, docling, settings, cancel, report, None);
+                }
+                Err(error) => return Err(error),
+            };
+        if parts.len() > 1 {
+            let report = std::cell::RefCell::new(&mut report);
+            return pdf_segments::convert_parts(
+                &parts,
+                output,
+                &identity(source, settings),
+                settings.runtime.conversion_output_mib as u64 * 1024 * 1024,
+                &cancel,
+                |part, current, total| report.borrow_mut()(Attempt {
+                    segment: Some(sag_protocol::ConversionSegment { current, total, start_page: part.start, end_page: part.end }),
+                    phase: Some("segment".into()), engine: String::new(), elapsed_ms: 0, error: None,
+                }),
+                |part, input, result| {
+                    convert_single(
+                        input,
+                        result,
+                        docling,
+                        settings,
+                        &cancel,
+                        |attempt| report.borrow_mut()(attempt),
+                        Some(part.start),
+                    )
+                },
+            );
+        }
+    }
+    convert_single(source, output, docling, settings, cancel, report, None)
+}
+
+fn convert_single(
+    source: &Path,
+    output: &Path,
+    docling: &Docling,
+    settings: &Settings,
+    cancel: impl Fn() -> bool + Sync,
     report: impl FnMut(Attempt),
+    original_start: Option<u32>,
 ) -> Result<()> {
     if cancel() {
         bail!("已停止转换，未发布输出")
@@ -141,59 +231,81 @@ pub fn convert(
     engines.push("Docling");
     let parent = output.parent().context("转换输出缺少父目录")?;
     fs::create_dir_all(parent)?;
-    let temporary = tempfile::NamedTempFile::new_in(parent)?;
+    // Parsers atomically replace this path. Close our handle first: Windows
+    // cannot replace a NamedTempFile that is still held open by its caller.
+    let temporary = tempfile::NamedTempFile::new_in(parent)?.into_temp_path();
     let report = std::cell::RefCell::new(report);
     run_engines(
         &engines,
         &cancel,
         |engine| {
             // Every fallback gets a fresh, unpublished result path.
-            fs::write(temporary.path(), b"")?;
+            fs::write(&temporary, b"")?;
             match engine {
                 "MinerU" => {
                     let key = crate::mineru::key(docling.data_directory(), &settings.mineru)?;
-                    crate::mineru::convert_with_runtime(
-                        source,
-                        temporary.path(),
-                        &settings.mineru,
-                        &key,
-                        &settings.runtime,
-                        &cancel,
-                        &|phase| {
-                            report.borrow_mut()(Attempt {
-                                phase: Some(phase.into()),
-                                engine: "MinerU".into(),
-                                elapsed_ms: 0,
-                                error: None,
-                            });
-                        },
-                    )?;
+                    let progress = |phase: &str| {
+                        report.borrow_mut()(Attempt {
+                            segment: None,
+                            phase: Some(phase.into()),
+                            engine: "MinerU".into(),
+                            elapsed_ms: 0,
+                            error: None,
+                        });
+                    };
+                    if let Some(start) = original_start {
+                        crate::mineru::convert_pdf_segment_with_runtime(
+                            source,
+                            &temporary,
+                            &settings.mineru,
+                            &key,
+                            &settings.runtime,
+                            &cancel,
+                            &progress,
+                            start,
+                        )?;
+                    } else {
+                        crate::mineru::convert_with_runtime(
+                            source,
+                            &temporary,
+                            &settings.mineru,
+                            &key,
+                            &settings.runtime,
+                            &cancel,
+                            &progress,
+                        )?;
+                    }
                 }
                 "anydoc" => match anydoc::convert_with_runtime(
                     source,
-                    temporary.path(),
+                    &temporary,
                     &settings.runtime,
                     &cancel,
                 )? {
                     anydoc::Outcome::Converted => {}
-                    anydoc::Outcome::NeedsOcr(detail) if !docling.has_profile(sag_protocol::DoclingProfile::Documents) => {
-                        return Err(crate::docling::ComponentMissing(format!("内置解析需要 OCR：{detail}")).into())
+                    anydoc::Outcome::NeedsOcr(detail)
+                        if !docling.has_profile(sag_protocol::DoclingProfile::Documents) =>
+                    {
+                        return Err(crate::docling::ComponentMissing(format!(
+                            "内置解析需要 OCR：{detail}"
+                        ))
+                        .into())
                     }
                     anydoc::Outcome::NeedsOcr(detail) => bail!("内置解析需要 OCR：{detail}"),
                 },
                 _ => docling.convert_docling_with_runtime(
                     source,
-                    temporary.path(),
+                    &temporary,
                     &settings.runtime,
                     &cancel,
                 )?,
             }
-            let size = fs::metadata(temporary.path())?.len();
+            let size = fs::metadata(&temporary)?.len();
             if size > settings.runtime.conversion_output_mib as u64 * 1024 * 1024 {
                 return Err(Failure::new(FailureKind::Memory, "转换输出超过配置的大小限制").into());
             }
             anyhow::ensure!(
-                !fs::read_to_string(temporary.path())?.trim().is_empty(),
+                !fs::read_to_string(&temporary)?.trim().is_empty(),
                 "解析器未生成有效正文"
             );
             Ok(())
@@ -210,6 +322,158 @@ pub fn convert(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn text_pdf(pages: u32) -> Vec<u8> {
+        use lopdf::{dictionary, Document, Object, Stream};
+        let mut pdf = Document::with_version("1.5");
+        let pages_id = pdf.new_object_id();
+        let font =
+            pdf.add_object(dictionary! {"Type"=>"Font","Subtype"=>"Type1","BaseFont"=>"Helvetica"});
+        let mut kids = Vec::<Object>::new();
+        for page in 1..=pages {
+            let content = pdf.add_object(Stream::new(
+                dictionary! {},
+                format!("BT /F1 12 Tf 10 50 Td (Evidence page {page}) Tj ET").into_bytes(),
+            ));
+            let id = pdf.add_object(dictionary!{"Type"=>"Page","Parent"=>pages_id,"MediaBox"=>vec![0.into(),0.into(),200.into(),100.into()],"Contents"=>content,"Resources"=>dictionary!{"Font"=>dictionary!{"F1"=>font}}});
+            kids.push(id.into());
+        }
+        pdf.objects.insert(
+            pages_id,
+            dictionary! {"Type"=>"Pages","Kids"=>kids,"Count"=>pages}.into(),
+        );
+        let catalog = pdf.add_object(dictionary! {"Type"=>"Catalog","Pages"=>pages_id});
+        pdf.trailer.set("Root", catalog);
+        let mut bytes = Vec::new();
+        pdf.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn long_pdf_uses_50_page_parts_and_merges_original_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("report.pdf");
+        fs::write(&source, text_pdf(51)).unwrap();
+        let output = dir.path().join("converted/report.md");
+        let settings = Settings::default();
+        convert(
+            &source,
+            &output,
+            &Docling::new(dir.path()),
+            &settings,
+            || false,
+            |_| {},
+        )
+        .unwrap();
+        let result = fs::read_to_string(&output).unwrap();
+        assert!(
+            result.contains("source-pages:1-50"),
+            "missing first segment range"
+        );
+        assert!(
+            result.contains("source-pages:51-51"),
+            "missing original last page"
+        );
+        assert!(result.find("Evidence page 1").unwrap() < result.find("Evidence page 51").unwrap());
+        assert_eq!(
+            fs::read_dir(output.parent().unwrap().join(".sag-pdf-parts"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn segmented_pdf_falls_back_per_part_and_retry_only_reads_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("report.pdf");
+        fs::write(&source, text_pdf(51)).unwrap();
+        let output = dir.path().join(".sag-converted/report.pdf.md");
+        let mut settings = Settings::default();
+        settings.mineru.enabled = true;
+        settings.mineru.provider = sag_protocol::mineru::MineruProvider::Official;
+        let mut attempts = vec![];
+        convert(
+            &source,
+            &output,
+            &Docling::new(dir.path()),
+            &settings,
+            || false,
+            |a| attempts.push(a),
+        )
+        .unwrap();
+        let engines = attempts
+            .iter()
+            .filter(|a| a.phase.is_none())
+            .map(|a| a.engine.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(engines, ["MinerU", "anydoc", "MinerU", "anydoc"]);
+        assert!(attempts
+            .iter()
+            .filter(|a| a.engine == "MinerU" && a.phase.is_none())
+            .all(|a| a.error.is_some()));
+        let first = fs::read(&output).unwrap();
+        convert(
+            &source,
+            &output,
+            &Docling::new(dir.path()),
+            &settings,
+            || false,
+            |attempt| assert_eq!(attempt.phase.as_deref(), Some("segment"), "cached parts must only report progress"),
+        )
+        .unwrap();
+        assert_eq!(fs::read(output).unwrap(), first);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pdf_split_preflight_failure_still_reaches_docling() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("repairable.pdf");
+        fs::write(&source, "PDF rejected by the splitter").unwrap();
+        let home = dir.path().join("docling");
+        fs::create_dir_all(home.join("bin")).unwrap();
+        fs::write(home.join("ready"), "2.140.0").unwrap();
+        let binary = home.join("bin/docling");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+ if [ "$1" = '--output-file' ]; then shift; output="$1"; fi
+ shift
+done
+printf '# recovered by alternate parser\n' > "$output"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = dir.path().join(".sag-converted/repaired.md");
+        let mut attempts = vec![];
+        convert(
+            &source,
+            &output,
+            &Docling::new(dir.path()),
+            &Settings::default(),
+            || false,
+            |a| attempts.push(a),
+        )
+        .unwrap();
+        assert!(fs::read_to_string(output)
+            .unwrap()
+            .contains("recovered by alternate parser"));
+        assert_eq!(
+            attempts
+                .iter()
+                .filter(|a| a.phase.is_none())
+                .map(|a| a.engine.as_str())
+                .collect::<Vec<_>>(),
+            ["anydoc", "Docling"]
+        );
+    }
+
     #[test]
     fn folder_cloud_formats_save_without_docling_but_media_still_requires_component() {
         let dir=tempfile::tempdir().unwrap();let root=dir.path().join("library");fs::create_dir(&root).unwrap();
@@ -247,6 +511,7 @@ mod tests {
         .unwrap();
         assert_eq!(seen, ["MinerU", "anydoc", "Docling"]);
         assert_eq!(chosen, "Docling");
+        let reports: Vec<_> = reports.iter().filter(|attempt| attempt.phase.is_none()).collect();
         assert_eq!(reports.len(), 3);
         assert!(reports[0].error.is_some());
         assert!(reports[2].error.is_none());
@@ -297,6 +562,7 @@ mod tests {
         assert_eq!(
             attempts
                 .iter()
+                .filter(|attempt| attempt.phase.is_none())
                 .map(|attempt| attempt.engine.as_str())
                 .collect::<Vec<_>>(),
             ["anydoc"]
@@ -329,5 +595,25 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("MinerU failed") && error.contains("anydoc failed"));
+    }
+}
+
+#[cfg(test)]
+mod parser_start_tests {
+    use super::*;
+    #[test]
+    fn reports_each_parser_before_work_including_fallback() {
+        let active = std::cell::RefCell::new(String::new());
+        let seen = std::cell::RefCell::new(Vec::new());
+        run_engines(&["MinerU", "anydoc", "Docling"], &|| false, |engine| {
+            assert_eq!(*active.borrow(), engine, "parser must be visible before work starts");
+            seen.borrow_mut().push(engine.to_string());
+            if engine == "Docling" { Ok(()) } else { bail!("fallback") }
+        }, |attempt| {
+            if attempt.phase.as_deref() == Some("starting") { *active.borrow_mut() = attempt.engine; }
+            else if attempt.phase.is_none() { active.borrow_mut().clear(); }
+        }).unwrap();
+        assert_eq!(*seen.borrow(), ["MinerU", "anydoc", "Docling"]);
+        assert!(active.borrow().is_empty());
     }
 }

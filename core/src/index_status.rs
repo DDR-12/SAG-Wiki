@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use sag_protocol::{IndexFileLog, IndexStatus, IndexTask};
+use sag_protocol::{IndexConversion, IndexFileLog, IndexStatus, IndexTask};
 use std::{collections::{BTreeMap,BTreeSet}, path::Path, sync::{Condvar, Mutex}};
 
 #[derive(Default)]
@@ -10,6 +10,7 @@ struct State {
     tasks: BTreeMap<String, IndexTask>,
     logs: BTreeMap<String, Vec<IndexFileLog>>,
     indexed: BTreeMap<String, (usize, usize)>,
+    retrying: BTreeSet<(String, String)>,
 }
 
 /// Pause only at file boundaries, without holding the database lock.
@@ -21,7 +22,12 @@ pub struct IndexControl {
 impl IndexControl {
     pub fn status(&self) -> IndexStatus {
         let state = self.state.lock().unwrap();
-        IndexStatus { paused: state.paused, tasks: state.tasks.values().cloned().collect() }
+        IndexStatus { paused: state.paused, tasks: state.tasks.values().cloned().map(|mut task| {
+            if task.stage == "converting" && task.files.iter().any(|file| state.retrying.contains(&(task.path.clone(), file.clone()))) {
+                task.stage = "retrying_conversion".into();
+            }
+            task
+        }).collect() }
     }
     pub fn set_paused(&self, paused: bool) -> IndexStatus {
         self.state.lock().unwrap().paused = paused;
@@ -45,7 +51,7 @@ impl IndexControl {
         state.logs.insert(root.into(), vec![]);
         state.indexed.insert(root.into(), (0, 0));
         state.tasks.insert(root.into(), IndexTask {
-            path: root.into(), stage: "scanning".into(), completed: 0, total: 0, files: vec![],
+            path: root.into(), stage: "scanning".into(), completed: 0, total: 0, files: vec![], conversions: vec![],
         });
     }
     pub fn task(&self, root: &str) -> IndexTask { self.state.lock().unwrap().tasks[root].clone() }
@@ -62,6 +68,7 @@ impl IndexControl {
         let mut state = self.state.lock().unwrap();
         let task = state.tasks.get_mut(root).unwrap();
         task.stage = stage.into(); task.total = total; task.completed = 0;
+        task.conversions.clear();
         if stage == "indexing_converted" {
             let count = state.indexed.get_mut(root).unwrap();
             count.1 = count.0 + total;
@@ -95,6 +102,21 @@ impl IndexControl {
     pub(crate) fn conversion_attempt(&self,root:&str,path:&Path,attempt:crate::conversion::Attempt) {
         let mut state=self.state.lock().unwrap();
         let path=path.to_string_lossy().into_owned();
+        // Live parser state is independent of the bounded history and survives
+        // cloud phase updates without being inferred from old log rows.
+        if let Some(task) = state.tasks.get_mut(root) {
+            if task.files.contains(&path) && task.stage == "converting" {
+                let segment = attempt.segment.clone().or_else(|| task.conversions.iter()
+                    .find(|item| item.path == path).and_then(|item| item.segment.clone()));
+                task.conversions.retain(|item| item.path != path);
+                if attempt.phase.is_some() || segment.is_some() {
+                    task.conversions.push(IndexConversion { path: path.clone(), engine: if attempt.phase.is_none() { String::new() } else { attempt.engine.clone() }, segment });
+                    task.conversions.sort_by(|a,b| a.path.cmp(&b.path));
+                }
+            }
+        }
+        // Starting only drives live status; retain the existing history format.
+        if matches!(attempt.phase.as_deref(), Some("starting" | "segment")) { return; }
         if let Some(log)=state.logs.get_mut(root) {
             if attempt.phase.is_some() && log.iter().rev().find(|row|row.path==path&&row.engine.as_deref()==Some(&attempt.engine))
                 .is_some_and(|row|row.phase==attempt.phase) {return;}
@@ -106,17 +128,23 @@ impl IndexControl {
         }
     }
     pub fn file<T>(&self, root: &str, path: &Path, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.file_attempt(root, path, false, work)
+    }
+    pub fn file_attempt<T>(&self, root: &str, path: &Path, retry: bool, work: impl FnOnce() -> Result<T>) -> Result<T> {
         let state = self.state.lock().unwrap();
         let mut state = self.resumed.wait_while(state, |state| state.paused && !state.stopped && !state.cancelled.contains(root)).unwrap();
         if state.stopped || state.cancelled.contains(root) { bail!("索引已停止") }
         let path = path.to_string_lossy().into_owned();
-        let stage = state.tasks[root].stage.clone();
+        let stage = if retry { "retrying_conversion".into() } else { state.tasks[root].stage.clone() };
+        if retry { state.retrying.insert((root.into(), path.clone())); }
         state.tasks.get_mut(root).unwrap().files.push(path.clone());
         drop(state);
         let mut result = work();
         let mut state = self.state.lock().unwrap();
+        state.retrying.remove(&(root.into(), path.clone()));
         if state.cancelled.contains(root) {result=Err(anyhow::anyhow!("文件夹已移除，已停止索引"));}
         state.tasks.get_mut(root).unwrap().files.retain(|file| file != &path);
+        state.tasks.get_mut(root).unwrap().conversions.retain(|item| item.path != path);
         let log = state.logs.get_mut(root).unwrap();
         if log.len() < 100 {
             log.push(IndexFileLog {
@@ -133,6 +161,21 @@ impl IndexControl {
 mod cancellation_tests {
     use super::*;
     #[test]
+    fn retry_label_only_applies_while_failed_file_is_running() {
+        let control = IndexControl::default();
+        control.begin("root"); control.phase("root", "converting", 2);
+        control.file_attempt("root", Path::new("failed.pdf"), true, || {
+            assert_eq!(control.status().tasks[0].stage, "retrying_conversion");
+            assert_eq!(control.status().tasks[0].total, 2);
+            Ok(())
+        }).unwrap();
+        control.file("root", Path::new("new.pdf"), || {
+            assert_eq!(control.status().tasks[0].stage, "converting");
+            Ok(())
+        }).unwrap();
+        assert_eq!(control.log("root")[0].stage, "retrying_conversion");
+    }
+    #[test]
     fn removing_one_root_cancels_its_work_without_stopping_other_roots() {
         let control=IndexControl::default();control.begin("old");control.begin("new");
         let result=control.file("old",Path::new("old/a.pdf"),||{control.cancel_root("old");Ok(())});
@@ -146,5 +189,78 @@ mod cancellation_tests {
         let (tx,rx)=std::sync::mpsc::channel();let worker=control.clone();
         let thread=std::thread::spawn(move||tx.send(worker.checkpoint_root("old").is_err()).unwrap());
         control.cancel_root("old");assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap());thread.join().unwrap();assert!(control.status().paused);
+    }
+}
+
+#[cfg(test)]
+mod parser_status_tests {
+    use super::*;
+    fn report(control: &IndexControl, path: &str, engine: &str, phase: Option<&str>) {
+        control.conversion_attempt("root", Path::new(path), crate::conversion::Attempt {
+            segment: None, engine: engine.into(), phase: phase.map(Into::into), elapsed_ms: 0, error: None,
+        });
+    }
+    #[test]
+    fn concurrent_parsers_follow_fallback_and_clear_at_file_boundaries() {
+        let control = IndexControl::default();
+        control.begin("root"); control.phase("root", "converting", 2);
+        control.file("root", Path::new("a.pdf"), || {
+            report(&control, "a.pdf", "MinerU", Some("starting"));
+            control.file("root", Path::new("b.pdf"), || {
+                report(&control, "b.pdf", "anydoc", Some("starting"));
+                assert_eq!(control.task("root").conversions.len(), 2);
+                report(&control, "a.pdf", "MinerU", None);
+                report(&control, "a.pdf", "Docling", Some("starting"));
+                let current = control.task("root").conversions;
+                assert_eq!(current.iter().find(|item|item.path=="a.pdf").unwrap().engine,"Docling");
+                control.set_paused(true);
+                assert_eq!(control.status().tasks[0].conversions.len(), 2);
+                control.set_paused(false);
+                Ok(())
+            })?;
+            assert_eq!(control.task("root").conversions.len(), 1);
+            control.cancel_root("root");
+            Ok(())
+        }).unwrap_err();
+        assert!(control.task("root").conversions.is_empty());
+        control.phase("root", "indexing_converted", 2);
+        assert!(control.status().tasks[0].conversions.is_empty());
+        control.finish("root");
+        assert!(control.status().tasks.is_empty());
+    }
+    #[test]
+    fn segment_status_survives_engine_boundaries_and_clears_with_the_file() {
+        let control=IndexControl::default();control.begin("root");control.phase("root","converting",1);
+        control.file("root",Path::new("long.pdf"),|| {
+            control.conversion_attempt("root",Path::new("long.pdf"),crate::conversion::Attempt {
+                segment:Some(sag_protocol::ConversionSegment {current:2,total:20,start_page:51,end_page:100}),
+                phase:Some("segment".into()),engine:String::new(),elapsed_ms:0,error:None,
+            });
+            report(&control,"long.pdf","MinerU",Some("starting"));
+            report(&control,"long.pdf","MinerU",None);
+            let item=control.task("root").conversions.remove(0);
+            assert!(item.engine.is_empty());assert_eq!(item.segment.unwrap().current,2);
+            assert_eq!(control.status().tasks.len(),1);
+            report(&control,"long.pdf","Docling",Some("starting"));
+            let item=control.task("root").conversions.remove(0);
+            assert_eq!(item.engine,"Docling");assert_eq!(item.segment.unwrap().start_page,51);
+            Ok(())
+        }).unwrap();
+        assert!(control.task("root").conversions.is_empty());
+        assert_eq!(control.status().tasks.len(),1);
+    }
+    #[test]
+    fn active_parser_does_not_depend_on_bounded_history() {
+        let control = IndexControl::default(); control.begin("root"); control.phase("root", "converting", 1);
+        control.state.lock().unwrap().logs.insert("root".into(), (0..100).map(|_| IndexFileLog {
+            time:0,path:"old.pdf".into(),stage:"converting".into(),phase:None,engine:None,elapsed_ms:None,status:"completed".into(),error:None,
+        }).collect());
+        control.file("root", Path::new("a.pdf"), || {
+            report(&control,"a.pdf","anydoc",Some("starting"));
+            assert_eq!(control.task("root").conversions[0].engine,"anydoc");
+            report(&control,"a.pdf","anydoc",None);
+            assert!(control.task("root").conversions.is_empty());
+            Ok(())
+        }).unwrap();
     }
 }

@@ -359,7 +359,7 @@ impl Store {
         if schema_version > 0 && schema_version < 7 {
             db.execute_batch("BEGIN; DELETE FROM chunk_fts; DELETE FROM chunks; UPDATE documents SET hash=''; UPDATE roots SET status='pending',error=NULL; UPDATE metadata SET version=version+1; COMMIT;")?;
         }
-        if schema_version < 9 && db.query_row(
+        if schema_version < 10 && db.query_row(
             "SELECT EXISTS(SELECT 1 FROM documents WHERE lower(path) GLOB '*.html' OR lower(path) GLOB '*.htm' OR lower(path) GLOB '*.md' OR lower(path) GLOB '*.markdown')",
             [], |row| row.get::<_, bool>(0),
         )? {
@@ -375,10 +375,10 @@ impl Store {
                 UPDATE roots SET status='pending',error=NULL WHERE path IN (SELECT root FROM documents WHERE id IN (SELECT id FROM resource_refresh));
                 DROP TABLE resource_refresh;
                 UPDATE metadata SET version=version+1;
-                PRAGMA user_version=9;
+                PRAGMA user_version=10;
                 COMMIT;")?;
         } else {
-            db.pragma_update(None, "user_version", 9)?;
+            db.pragma_update(None, "user_version", 10)?;
         }
         // Slots are cheap; open read connections only when a configured worker is used.
         let query_readers = (0..64).map(|_| Mutex::new(None)).collect();
@@ -564,7 +564,10 @@ impl Store {
         let path = path_text(directory)?;
         let prefix = format!("{}{}", path.trim_end_matches(std::path::MAIN_SEPARATOR), std::path::MAIN_SEPARATOR);
         Ok(self.connection().query_row(
-            "SELECT COUNT(*) FROM documents WHERE path=?1 OR instr(path,?2)=1",
+            // Converted documents live under .sag-converted; count them by their source path.
+            "SELECT COUNT(*) FROM documents d WHERE d.path=?1 OR instr(d.path,?2)=1
+               OR EXISTS(SELECT 1 FROM conversions c WHERE c.output=d.path AND c.valid=1
+                         AND (c.source=?1 OR instr(c.source,?2)=1))",
             params![path, prefix], |row| row.get::<_, i64>(0),
         )? as usize)
     }
@@ -679,21 +682,53 @@ impl Store {
         let canonical = path
             .canonicalize()
             .with_context(|| format!("路径不可用：{}", path.display()))?;
-        let allowed = {
+        let roots = {
             let connection = self.connection();
             let mut query = connection.prepare_cached("SELECT path FROM roots")?;
-            let paths = query.query_map([], |r| r.get::<_, String>(0))?;
-            let mut allowed = false;
-            for path in paths {
-                allowed |= canonical.starts_with(Path::new(&path?));
-            }
-            allowed
+            let paths = query.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            paths
         };
+        let mut allowed = roots.iter().any(|root| canonical.starts_with(root));
+        if !allowed {
+            for root in &roots {
+                let actual = match Path::new(root).canonicalize() {
+                    Ok(path) => path,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error).with_context(|| format!("路径不可用：{root}")),
+                };
+                if let Ok(relative) = canonical.strip_prefix(actual) {
+                    if self.is_excluded(&Path::new(root).join(relative))? {
+                        bail!("此路径已从知识库移除，请先重新添加")
+                    }
+                    allowed = true;
+                    break;
+                }
+            }
+        }
         if !allowed {
             bail!("该路径不在已添加的文件夹内")
         };
         if self.is_excluded(&canonical)? { bail!("此路径已从知识库移除，请先重新添加") }
         Ok(canonical)
+    }
+    // Preserve the path namespace used by an index created before a root became a symlink.
+    pub(crate) fn indexed_path(&self, path: &Path) -> Result<PathBuf> {
+        let canonical = self.authorize(path)?;
+        let roots = self.roots()?;
+        if roots.iter().any(|root| canonical.starts_with(&root.path)) {
+            return Ok(canonical);
+        }
+        for root in roots {
+            let actual = match Path::new(&root.path).canonicalize() {
+                Ok(path) => path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).with_context(|| format!("路径不可用：{}", root.path)),
+            };
+            if let Ok(relative) = canonical.strip_prefix(actual) {
+                return Ok(Path::new(&root.path).join(relative));
+            }
+        }
+        bail!("目录已从知识库移除")
     }
     pub fn add_root(&self, path: &Path) -> Result<String> {
         let path = path.canonicalize().context("无法打开这个文件夹")?;
@@ -810,6 +845,12 @@ impl Store {
     }
     pub fn document(&self, path: &Path) -> Result<Document> {
         Ok(self.matching_document(path, |_| true)?.unwrap())
+    }
+    pub(crate) fn has_valid_conversion(&self, source: &Path) -> Result<bool> {
+        Ok(self.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversions WHERE source=? AND valid=1)",
+            [path_text(source)?], |row| row.get(0),
+        )?)
     }
     pub(crate) fn matching_document(&self, path: &Path, matches: impl FnOnce(&str) -> bool) -> Result<Option<Document>> {
         let path = self.authorize(path)?;
@@ -1400,7 +1441,8 @@ impl Store {
                             // relative source links from directory depth, not the file name.
                             let staged = tempfile::Builder::new().prefix(".sag-pending-").suffix(".md")
                                 .tempfile_in(output.parent().unwrap())?.into_temp_path();
-                            self.indexing.file(root, source, || crate::conversion::convert(source, &staged, &self.docling, settings, || self.indexing.cancelled(root), |attempt| self.indexing.conversion_attempt(root,source,attempt)))?;
+                            let retry: bool = self.connection().query_row("SELECT EXISTS(SELECT 1 FROM index_issues WHERE path=?)", [&source_text], |row| row.get(0))?;
+                            self.indexing.file_attempt(root, source, retry, || crate::conversion::convert(source, &staged, &self.docling, settings, || self.indexing.cancelled(root), |attempt| self.indexing.conversion_attempt(root,source,attempt)))?;
                             converted = true;
                             // Pause between conversion and acceptance without retaining an
                             // "active file" entry or a database lock.
@@ -2729,6 +2771,37 @@ while [ ! -f "$(dirname "$0")/release" ]; do sleep 0.02; done
             fs::write(&metadata, serde_json::to_vec(&invalid).unwrap()).unwrap();
             assert!(store.scan(root_text, |_| {}).is_err());
             assert_eq!(fs::read_to_string(root.join(".sag-converted/recording.mp3.md")).unwrap(), "audiocachedevidence.");
+        }
+    }
+
+    #[test]
+    fn mineru_completed_output_is_reused_after_reopening() {
+        let (dir, store, root) = setup();
+        let mut settings = store.settings().unwrap();
+        settings.convert_other_formats = true;
+        settings.mineru.enabled = true;
+        store.save_settings(&settings).unwrap();
+        let source = root.join("cached.pdf");
+        // Invalid input and no API key: any attempt to convert again must fail.
+        fs::write(&source, "already processed source fixture").unwrap();
+        let output = crate::docling::output_path(&root, &source).unwrap();
+        fs::create_dir_all(output.parent().unwrap()).unwrap();
+        let body = "cachedcaption\n![figure](.sag-mineru-assets/hash/images/a.png)";
+        fs::write(&output, body).unwrap();
+        let image = output.parent().unwrap().join(".sag-mineru-assets/hash/images/a.png");
+        fs::create_dir_all(image.parent().unwrap()).unwrap();
+        fs::write(&image, b"image fixture").unwrap();
+        let identity = format!("{}:{}", crate::conversion::identity(&source, &settings), crate::docling::fingerprint(&source).unwrap());
+        store.connection().execute("INSERT INTO conversions(source,root,source_hash,output,output_hash,valid) VALUES(?,?,?,?,?,1)", params![path_text(&source).unwrap(),path_text(&root).unwrap(),identity,path_text(&output).unwrap(),crate::docling::fingerprint(&output).unwrap()]).unwrap();
+        let modified = fs::metadata(&output).unwrap().modified().unwrap();
+        drop(store);
+        for _ in 0..2 {
+            let reopened = Store::open(&dir.path().join("app/db.sqlite")).unwrap();
+            reopened.scan(root.to_str().unwrap(), |_| {}).unwrap();
+            assert_eq!(fs::metadata(&output).unwrap().modified().unwrap(), modified);
+            assert_eq!(fs::read_to_string(&output).unwrap(), body);
+            assert_eq!(fs::read(&image).unwrap(), b"image fixture");
+            assert_eq!(reopened.search_files("cachedcaption", &[], 5).unwrap().len(), 1);
         }
     }
 

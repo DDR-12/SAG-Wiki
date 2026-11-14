@@ -51,6 +51,8 @@ fn emit(app: &EventSink, event: &str, payload: impl serde::Serialize + Clone) {
     ));
 }
 pub struct Service {
+    pub api: Arc<crate::http_api::ApiService>,
+    pub requests: Arc<tokio::sync::Semaphore>,
     pub store: Arc<Store>,
     explorer: Arc<explore::Explorer>,
     client: reqwest::Client,
@@ -1203,6 +1205,8 @@ impl Service {
             remove_root,
         )?;
         Ok(Arc::new(Self {
+            api: crate::http_api::ApiService::open(&data)?,
+            requests: Arc::new(tokio::sync::Semaphore::new(20)),
             explorer: Arc::new(explore::Explorer::new(store.clone())),
             store,
             client,
@@ -1220,6 +1224,7 @@ impl Service {
     }
     pub async fn finish(&self) -> anyhow::Result<()> {
         self.stop.cancel();
+        self.api.shutdown().await?;
         self.store.indexing.stop();
         self.store.docling.cancel();
         let worker = self.worker.lock().unwrap().take();
@@ -1244,6 +1249,7 @@ impl Service {
             data_directory: self.data_dir.display().to_string(),
         })
     }
+    pub(crate) fn http_client(&self) -> reqwest::Client { self.client.clone() }
     pub async fn handle(
         self: &Arc<Self>,
         operation: sag_protocol::Operation,
@@ -1287,6 +1293,7 @@ impl Service {
                 }
         );
         let result = match operation {
+            Op::Api { action } => Out::Api(self.api.manage(action, self).await.map_err(error)?),
             Op::Info => Out::Info(self.info().map_err(error)?),
             Op::Snapshot => Out::Snapshot(sag_protocol::Snapshot {
                 roots: list_roots(self)?,
@@ -1470,6 +1477,7 @@ impl Service {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
                     Err(e) => return Err(error(e)),
                 }
+                self.api.reset().await.map_err(error)?;
                 models::clear_secrets(&self.data_dir).map_err(error)?;
                 self.cli.configure(sag_protocol::Access::default()).map_err(error)?;
                 Out::Unit

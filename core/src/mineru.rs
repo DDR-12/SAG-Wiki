@@ -18,6 +18,7 @@ use std::{
 const MIB: u64 = 1024 * 1024;
 const ZIP_LIMIT: u64 = 200 * MIB;
 const PAGE_LIMIT: u32 = 200;
+pub(crate) const PDF_SEGMENT_PAGES: u32 = 50;
 
 pub fn supports(source: &Path) -> bool {
     source
@@ -175,11 +176,11 @@ fn normalize_opensource(value:Value)->Result<Value> {
     for key in ["data","result","task"] {if let Some(v)=value.get(key){return normalize_opensource(v.clone());}}
     Ok(json!({"state":"pending"}))
 }
-async fn finish_302(client:&Client,result:&Value,part:&Part,require_pages:bool,limit:u64)->Result<String> {
+async fn finish_302(client:&Client,result:&Value,part:&Part,require_pages:bool,limit:u64,parent:Option<&Path>)->Result<String> {
     if let Some(md)=result.get("markdown").and_then(Value::as_str){ensure!(!require_pages,"MinerU 分段结果缺少页码映射，尝试本地解析");ensure!(md.len() as u64<=limit,"MinerU 正文超过配置上限");return Ok(md.into());}
     let response=client.get(safe_url(field(result,"full_zip_url")?)?).send().await?;
     let content=bytes(response,ZIP_LIMIT).await?;
-    if content.starts_with(b"PK\x03\x04"){return archive_content_with_limit(content,part.start,part.end,require_pages,limit);}
+    if content.starts_with(b"PK\x03\x04"){return archive_content_with_assets(content,part.start,part.end,require_pages,limit,parent);}
     let payload=unwrap_payload(serde_json::from_slice(&content).unwrap_or_else(|_|json!(String::from_utf8_lossy(&content))));
     let result=normalize_opensource(payload)?;
     if let Some(md)=result.get("markdown").and_then(Value::as_str){ensure!(!require_pages,"MinerU 分段结果缺少页码映射，尝试本地解析");ensure!(md.len() as u64<=limit,"MinerU 正文超过配置上限");return Ok(md.into());}
@@ -278,11 +279,11 @@ fn task_lock(path: &Path, cancel: &impl Fn() -> bool) -> Result<TaskLock> {
 }
 
 #[derive(Debug)]
-struct Part {
-    bytes: Vec<u8>,
-    start: u32,
-    end: u32,
-    name: String,
+pub(crate) struct Part {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) start: u32,
+    pub(crate) end: u32,
+    pub(crate) name: String,
 }
 #[cfg(test)]
 fn prepare(source: &Path, limit: u64, cancel: &impl Fn() -> bool) -> Result<Vec<Part>> {
@@ -291,6 +292,23 @@ fn prepare(source: &Path, limit: u64, cancel: &impl Fn() -> bool) -> Result<Vec<
 fn prepare_with_runtime(
     source: &Path,
     limit: u64,
+    runtime: &RuntimeSettings,
+    cancel: &impl Fn() -> bool,
+) -> Result<Vec<Part>> {
+    prepare_with_page_limit(source, limit, PAGE_LIMIT, runtime, cancel)
+}
+pub(crate) fn prepare_pdf_segments(
+    source: &Path,
+    limit: u64,
+    runtime: &RuntimeSettings,
+    cancel: &impl Fn() -> bool,
+) -> Result<Vec<Part>> {
+    prepare_with_page_limit(source, limit, PDF_SEGMENT_PAGES, runtime, cancel)
+}
+fn prepare_with_page_limit(
+    source: &Path,
+    limit: u64,
+    page_limit: u32,
     runtime: &RuntimeSettings,
     cancel: &impl Fn() -> bool,
 ) -> Result<Vec<Part>> {
@@ -333,11 +351,14 @@ fn prepare_with_runtime(
         lopdf::Document::load_mem(&content).context("无法读取 PDF 页码，尝试下一解析器")?;
     let count = u32::try_from(document.get_pages().len()).context("PDF 页数超过支持范围")?;
     ensure!(count > 0, "PDF 中没有可解析页面");
-    ensure!(
-        count as usize <= runtime.max_document_pages,
-        "文档页数超过配置上限"
-    );
-    if count <= PAGE_LIMIT && content.len() as u64 <= limit {
+    if count as usize > runtime.max_document_pages {
+        return Err(crate::process_supervisor::Failure::new(
+            crate::process_supervisor::FailureKind::Memory,
+            "文档页数超过配置上限",
+        ).into());
+    }
+    ensure!(!cancel(), "已停止 MinerU 转换，未发布输出");
+    if count <= page_limit && content.len() as u64 <= limit {
         return Ok(vec![Part {
             bytes: content,
             start: 1,
@@ -348,28 +369,52 @@ fn prepare_with_runtime(
     let mut ranges = std::collections::VecDeque::new();
     let mut start = 1;
     while start <= count {
-        let end = (start + PAGE_LIMIT - 1).min(count);
+        let end = (start + page_limit - 1).min(count);
         ranges.push_back((start, end));
         start = end + 1;
     }
+    let qpdf = std::env::var_os("SAG_QPDF").map(PathBuf::from).unwrap_or_else(|| {
+        #[cfg(test)]
+        { return Path::new(env!("CARGO_MANIFEST_DIR")).join("../src-tauri/bin/qpdf/bin").join(if cfg!(windows) { "qpdf.exe" } else { "qpdf" }); }
+        #[cfg(not(test))]
+        std::env::current_exe().unwrap_or_default().parent().unwrap_or(Path::new(".")).join("qpdf/bin").join(if cfg!(windows) { "qpdf.exe" } else { "qpdf" })
+    });
+    ensure!(qpdf.is_file(), "缺少 QPDF 拆页程序，请重新安装完整安装包");
+    let temporary = tempfile::tempdir()?;
+    // QPDF's Windows path parser does not accept verbatim (\\?\) paths.
+    // Use a short local snapshot, also keeping all segments on the same bytes
+    // if the original file changes while preparation is running.
+    let qpdf_source = temporary.path().join("input.pdf");
+    std::fs::write(&qpdf_source, &content)?;
+    let split_started = std::time::Instant::now();
     let mut parts = Vec::new();
+    let mut prepared_bytes = 0u64;
     while let Some((start, end)) = ranges.pop_front() {
         ensure!(!cancel(), "已停止 MinerU 转换，未发布输出");
-        let mut split = document.clone();
-        let remove = (1..=count)
-            .filter(|page| *page < start || *page > end)
-            .collect::<Vec<_>>();
-        split.delete_pages(&remove);
-        split.prune_objects();
-        split.compress();
-        let mut bytes = Vec::new();
-        split.save_to(&mut bytes)?;
+        let destination = temporary.path().join(format!("pages-{start}-{end}.pdf"));
+        let remaining = Duration::from_secs(120).saturating_sub(split_started.elapsed());
+        ensure!(!remaining.is_zero(), "QPDF 拆页超时");
+        let mut command = std::process::Command::new(&qpdf);
+        command.arg("--warning-exit-0").arg("--deterministic-id").arg("--empty").arg("--pages").arg(&qpdf_source)
+            .arg(format!("{start}-{end}")).arg("--").arg(&destination);
+        crate::process_supervisor::run(&mut command,
+            crate::process_supervisor::Limits { timeout: remaining, memory_bytes: None },
+            cancel, |_| {}).context("QPDF 拆页失败")?;
+        let bytes = std::fs::read(&destination)?;
         if bytes.len() as u64 > limit {
             ensure!(start < end, "PDF 单页超过所选 MinerU 服务商上传限制");
             let middle = start + (end - start) / 2;
             ranges.push_front((middle + 1, end));
             ranges.push_front((start, middle));
             continue;
+        }
+        ensure!(!cancel(), "已停止 MinerU 转换，未发布输出");
+        prepared_bytes += bytes.len() as u64;
+        if prepared_bytes > input_limit {
+            return Err(crate::process_supervisor::Failure::new(
+                crate::process_supervisor::FailureKind::Memory,
+                "PDF 分段准备超过配置的转换输入大小限制",
+            ).into());
         }
         parts.push(Part {
             bytes,
@@ -443,7 +488,7 @@ fn read_task(path: &Path) -> Result<Option<Task>> {
 }
 
 fn inline_images(text: &str) -> String {
-    // Result assets expire remotely; use explicit image placeholders rather than broken relative links.
+    // Only for checking whether OCR returned usable text; output keeps images.
     static IMAGES: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"!\[([^\]]*)\]\([^\n]*?\)|(?is:<img\b[^>]*>)").unwrap()
     });
@@ -469,7 +514,7 @@ fn effective_markdown(text: &str) -> Result<String> {
         content.chars().any(char::is_alphanumeric),
         "MinerU 未提取到有效正文，尝试下一解析器"
     );
-    Ok(output)
+    Ok(text.to_owned())
 }
 
 #[cfg(test)]
@@ -482,6 +527,7 @@ fn archive_content(archive: Vec<u8>, start: u32, end: u32, require_pages: bool) 
         RuntimeSettings::default().conversion_output_mib as u64 * MIB,
     )
 }
+#[cfg(test)]
 fn archive_content_with_limit(
     archive: Vec<u8>,
     start: u32,
@@ -489,6 +535,20 @@ fn archive_content_with_limit(
     require_pages: bool,
     output_limit: u64,
 ) -> Result<String> {
+    archive_content_with_assets(archive, start, end, require_pages, output_limit, None)
+}
+
+// Immutable result packages survive the staged Markdown renames performed by
+// conversion and Store. Failed/replaced conversions cannot break older readers.
+fn archive_content_with_assets(
+    archive: Vec<u8>, start: u32, end: u32, require_pages: bool,
+    output_limit: u64, parent: Option<&Path>,
+) -> Result<String> {
+    let package = format!(".sag-mineru-assets/{:x}", Sha256::digest(&archive));
+    let staging = parent.map(tempfile::tempdir_in).transpose()?;
+    let mut image_paths = Vec::new();
+    let mut full_path = PathBuf::from("full.md");
+    let mut total = 0u64;
     let mut zip =
         zip::ZipArchive::new(std::io::Cursor::new(archive)).context("MinerU 结果不是有效 ZIP")?;
     let mut full = None;
@@ -504,6 +564,22 @@ fn archive_content_with_limit(
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
+        let image = path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext|
+            ["png", "jpg", "jpeg", "gif", "webp", "svg"].contains(&ext.to_ascii_lowercase().as_str()));
+        if image {
+            total = total.checked_add(entry.size()).context("MinerU 图片大小无效")?;
+            ensure!(entry.size() <= 20 * MIB && total <= ZIP_LIMIT, "MinerU 图片超过大小限制");
+            if let Some(dir) = &staging {
+                let target = dir.path().join(&path);
+                std::fs::create_dir_all(target.parent().context("图片路径无效")?)?;
+                let mut bytes = Vec::new();
+                entry.take(20 * MIB + 1).read_to_end(&mut bytes)?;
+                ensure!(bytes.len() as u64 <= 20 * MIB, "MinerU 图片超过大小限制");
+                std::fs::write(target, bytes)?;
+            }
+            image_paths.push(path);
+            continue;
+        }
         if name != "full.md" && !name.ends_with("_content_list.json") {
             continue;
         }
@@ -511,17 +587,56 @@ fn archive_content_with_limit(
         let mut text = String::new();
         entry.take(output_limit + 1).read_to_string(&mut text)?;
         ensure!(text.len() as u64 <= output_limit, "MinerU 正文超过大小限制");
+        if let Some(dir) = &staging {
+            let target = dir.path().join(&path);
+            std::fs::create_dir_all(target.parent().context("结果路径无效")?)?;
+            std::fs::write(target, &text)?;
+        }
         if name == "full.md" {
+            full_path = path;
             full = Some(text);
         } else {
             content_list = Some(text);
         }
     }
+    let publish = |text: String| -> Result<String> {
+        let Some(parent) = parent else { return Ok(text); };
+        let mut text = text;
+        for path in &image_paths {
+            let relative = path.strip_prefix(full_path.parent().unwrap_or(Path::new(""))).unwrap_or(path);
+            let source = relative.to_string_lossy().replace('\\', "/");
+            let target = format!("{package}/{}", path.to_string_lossy().replace('\\', "/"));
+            static DESTINATIONS: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(
+                r#"!\[(?:\\.|\[[^\]\n]*\]|[^\]\\\n])*\]\(\s*(?:<([^<>\r\n]*)>|([^\s<>]+?))(?:\s+['"][^\n]*?['"])?\s*\)|(?i:<img\b[^>]*?\bsrc\s*=\s*["']([^"']*)["'][^>]*>)"#
+            ).unwrap());
+            text = DESTINATIONS.replace_all(&text, |captures: &regex::Captures| {
+                let whole = captures.get(0).unwrap();
+                let destination = captures.get(1).or_else(|| captures.get(2)).or_else(|| captures.get(3)).unwrap();
+                if destination.as_str().trim_start_matches("./") != source { return whole.as_str().to_owned(); }
+                let start = destination.start() - whole.start();
+                let end = destination.end() - whole.start();
+                format!("{}{}{}", &whole.as_str()[..start], target, &whole.as_str()[end..])
+            }).into_owned();
+            let definition = regex::Regex::new(&format!(
+                r#"(?m)(^\s*\[[^\]\n]+\]:\s*<?){}(?P<tail>[^\r\n]*)"#,
+                regex::escape(&source)
+            )).unwrap();
+            text = definition.replace_all(&text, format!("${{1}}{target}$tail")).into_owned();
+        }
+        let destination = parent.join(&package);
+        std::fs::create_dir_all(destination.parent().context("资源路径无效")?)?;
+        if !destination.exists() {
+            if let Err(error) = std::fs::rename(staging.as_ref().unwrap().path(), &destination) {
+                if !destination.is_dir() { return Err(error.into()); }
+            }
+        }
+        Ok(text)
+    };
     // Full Markdown preserves every supported construct for ordinary files.
     if !require_pages {
         let full = full.context("MinerU 结果中缺少 full.md")?;
         ensure!(!full.trim().is_empty(), "MinerU 未返回有效正文");
-        return effective_markdown(&full);
+        return publish(effective_markdown(&full)?);
     }
     if let Some(list) = content_list {
         let list: Value = serde_json::from_str(&list).context("MinerU 页码映射无效")?;
@@ -557,12 +672,60 @@ fn archive_content_with_limit(
                     _ => bail!("MinerU 结构化正文格式无效"),
                 }
             };
+            // MinerU names the same value differently across versions, so take the
+            // first populated field and ignore a block that carries nothing usable.
+            // A version may also nest the text in an object instead of a plain string.
+            let text_of = |name: &str| -> String {
+                fn leaf(value: &Value) -> &str {
+                    match value {
+                        Value::String(text) => text,
+                        _ => value
+                            .get("text")
+                            .or_else(|| value.get("content"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    }
+                }
+                match row.get(name) {
+                    Some(Value::String(text)) => text.clone(),
+                    Some(Value::Array(items)) => items
+                        .iter()
+                        .map(leaf)
+                        .filter(|text| !text.trim().is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n\n"),
+                    _ => String::new(),
+                }
+            };
+            let first = |names: &[&str]| {
+                names
+                    .iter()
+                    .map(|name| text_of(name))
+                    .find(|value| !value.trim().is_empty())
+                    .unwrap_or_default()
+            };
             let kind = row["type"].as_str().unwrap_or("");
             let mut body = String::new();
             match kind {
+                // Running headers, folios and footers repeat on every page and only
+                // add retrieval noise; full.md leaves them out for single-part files.
+                "header" | "footer" | "page_number" => continue,
                 "image" => {
-                    body.push_str(&format!("[图片：{}]", strings("image_caption")?));
+                    if let Some(path) = row["img_path"].as_str() {
+                        body.push_str(&format!("![]({path})\n\n"));
+                    }
+                    body.push_str(&strings("image_caption")?);
+                    body.push_str("\n\n");
                     body.push_str(&strings("image_footnote")?);
+                }
+                "chart" => {
+                    // An empty placeholder carries no information but still earns a
+                    // page anchor, so emit the label only when there is a description.
+                    let caption = first(&["chart_caption", "content", "text"]);
+                    if !caption.trim().is_empty() {
+                        body.push_str(&format!("[图片：{caption}]"));
+                    }
+                    body.push_str(&first(&["chart_footnote"]));
                 }
                 "table" => {
                     body.push_str(&strings("table_caption")?);
@@ -570,7 +733,7 @@ fn archive_content_with_limit(
                     let table = strings("table_body")?;
                     ensure!(
                         !table.trim().is_empty(),
-                        "MinerU 分段表格缺少正文，尝试下一解析器"
+                        "MinerU 分段第 {original} 页表格缺少正文，尝试下一解析器"
                     );
                     body.push_str(&table);
                     body.push_str("\n\n");
@@ -585,7 +748,7 @@ fn archive_content_with_limit(
                 }
                 "equation" => {
                     let text = strings("text")?;
-                    ensure!(!text.trim().is_empty(), "MinerU 分段公式缺少正文");
+                    ensure!(!text.trim().is_empty(), "MinerU 分段第 {original} 页公式缺少正文，尝试下一解析器");
                     body.push_str("$$\n");
                     body.push_str(&text);
                     body.push_str("\n$$");
@@ -597,7 +760,67 @@ fn archive_content_with_limit(
                     }
                     body.push_str(&strings("text")?);
                 }
-                _ => bail!("MinerU 分段结果包含无法保留的正文类型，尝试下一解析器"),
+                "code" => {
+                    let caption = first(&["code_caption"]);
+                    if !caption.trim().is_empty() {
+                        body.push_str(&caption);
+                        body.push_str("\n\n");
+                    }
+                    let code = first(&["code_body", "text"]);
+                    ensure!(
+                        !code.trim().is_empty(),
+                        "MinerU 分段第 {original} 页代码块缺少正文，尝试下一解析器"
+                    );
+                    // Outrun any backtick run inside the code so the fence cannot close early.
+                    let fence = "`".repeat(
+                        code.split(|value| value != '`')
+                            .map(str::len)
+                            .max()
+                            .unwrap_or(0)
+                            .max(2)
+                            + 1,
+                    );
+                    // Keep the language label instead of dropping names such as
+                    // "objective c" or "c++ (17)": sanitise rather than discard.
+                    let language = first(&["guess_lang", "code_language"]);
+                    let language = language
+                        .trim()
+                        .chars()
+                        .take(24)
+                        .map(|value| {
+                            if value.is_ascii_whitespace() {
+                                '-'
+                            } else if value.is_ascii_alphanumeric() || "+-_.#".contains(value) {
+                                value
+                            } else {
+                                '\0'
+                            }
+                        })
+                        .filter(|value| *value != '\0')
+                        .collect::<String>();
+                    let language = language.trim_matches('-');
+                    body.push_str(&fence);
+                    body.push_str(language);
+                    body.push('\n');
+                    body.push_str(code.trim_end_matches(['\n', '\r']));
+                    body.push('\n');
+                    body.push_str(&fence);
+                    body.push('\n');
+                    body.push_str(&first(&["code_footnote"]));
+                }
+                other => {
+                    // Unknown named types keep their text; only a block with nothing
+                    // readable at all fails, and the message names it for diagnosis.
+                    let body_key = format!("{other}_body");
+                    let text_key = format!("{other}_text");
+                    let text = first(&["text", "content", "body", &body_key, &text_key]);
+                    let invalid = format!("\"{}\"", other.chars().take(32).collect::<String>());
+                    ensure!(
+                        !text.trim().is_empty(),
+                        "MinerU 分段第 {original} 页包含不支持的类型 {invalid}，尝试下一解析器"
+                    );
+                    body.push_str(&text);
+                }
             }
             if body.trim().is_empty() {
                 continue;
@@ -613,7 +836,7 @@ fn archive_content_with_limit(
             output.push_str("\n\n");
         }
         ensure!(body_bytes > 0, "MinerU 未返回有效正文");
-        return effective_markdown(&output);
+        return publish(effective_markdown(&output)?);
     }
     bail!("MinerU 分段结果缺少页码映射，尝试下一解析器")
 }
@@ -751,7 +974,7 @@ async fn parse_part_with_limit(
         task.upload = None;
         write_task(path, &task)?;
     }
-    if let Some(result)=&task.result {progress("downloading");return finish_302(client,result,part,require_pages,output_limit).await;}
+    if let Some(result)=&task.result {progress("downloading");return finish_302(client,result,part,require_pages,output_limit,path.parent().and_then(Path::parent)).await;}
     progress("queued");
     let poll = endpoint(
         base,
@@ -770,9 +993,9 @@ async fn parse_part_with_limit(
             "done" => {
                 progress("downloading");
                 if config.provider==MineruProvider::Ai302 {
-                    return finish_302(client,result,part,require_pages,output_limit).await;
+                    return finish_302(client,result,part,require_pages,output_limit,path.parent().and_then(Path::parent)).await;
                 }
-                return archive_content_with_limit(
+                return archive_content_with_assets(
                     bytes(
                         client
                             .get(safe_url(field(result, "full_zip_url")?)?)
@@ -785,19 +1008,28 @@ async fn parse_part_with_limit(
                     part.end,
                     require_pages,
                     output_limit,
+                    path.parent().and_then(Path::parent),
                 );
             }
             "failed" => {
                 std::fs::remove_file(path)?;
                 bail!("MinerU 解析失败，尝试下一解析器");
             }
-            "waiting-file" | "pending" => {
-                progress("queued");
-                tokio::time::sleep(Duration::from_secs(config.poll_interval_secs)).await;
-            }
-            "running" | "converting" => {
-                progress("parsing");
-                tokio::time::sleep(Duration::from_secs(config.poll_interval_secs)).await;
+            state @ ("waiting-file" | "pending" | "running" | "converting") => {
+                // Query once before checking age: a previously timed-out task may
+                // now have a complete result. Never restart a pending task's
+                // budget on every reindex, or the same journal can wait forever.
+                let remaining = config
+                    .task_timeout_secs
+                    .saturating_sub(now().saturating_sub(task.submitted_at));
+                ensure!(remaining > 0,
+                    "MinerU 任务超时（从首次提交计算，当前状态：{state}），任务记录已保留，尝试本地解析");
+                progress(if matches!(state, "running" | "converting") {
+                    "parsing"
+                } else {
+                    "queued"
+                });
+                tokio::time::sleep(Duration::from_secs(config.poll_interval_secs.min(remaining))).await;
             }
             _ => bail!("MinerU 返回了未知任务状态"),
         }
@@ -874,6 +1106,29 @@ fn convert_at(
         &|_| {},
     )
 }
+pub(crate) fn convert_pdf_segment_with_runtime(
+    source: &Path,
+    output: &Path,
+    config: &MineruConfig,
+    key: &str,
+    runtime: &RuntimeSettings,
+    cancel: &impl Fn() -> bool,
+    progress: &impl Fn(&str),
+    original_start: u32,
+) -> Result<()> {
+    convert_range_at_with_progress(
+        source,
+        output,
+        config,
+        key,
+        cancel,
+        config.provider.base_url(),
+        runtime,
+        progress,
+        Some(original_start),
+    )
+}
+
 fn convert_at_with_progress(
     source: &Path,
     output: &Path,
@@ -884,6 +1139,22 @@ fn convert_at_with_progress(
     runtime: &RuntimeSettings,
     progress: &impl Fn(&str),
 ) -> Result<()> {
+    convert_range_at_with_progress(
+        source, output, config, key, cancel, base, runtime, progress, None,
+    )
+}
+
+fn convert_range_at_with_progress(
+    source: &Path,
+    output: &Path,
+    config: &MineruConfig,
+    key: &str,
+    cancel: &impl Fn() -> bool,
+    base: &str,
+    runtime: &RuntimeSettings,
+    progress: &impl Fn(&str),
+    original_start: Option<u32>,
+) -> Result<()> {
     if config.provider == MineruProvider::Ai302 {
         ensure!(source.extension().is_some_and(|ext|ext.eq_ignore_ascii_case("pdf")),"302.AI 开源部署版仅支持 PDF，尝试本地解析");
     }
@@ -893,12 +1164,18 @@ fn convert_at_with_progress(
     let _admission = admission(config, cancel)?;
     progress("preparing");
     let started = std::time::Instant::now();
-    let parts = prepare_with_runtime(
+    let mut parts = prepare_with_runtime(
         source,
         config.provider.upload_limit_bytes(),
         runtime,
         cancel,
     )?;
+    if let Some(start) = original_start {
+        for part in &mut parts {
+            part.start += start - 1;
+            part.end += start - 1;
+        }
+    }
     let output_limit = runtime.conversion_output_mib as u64 * MIB;
     let prepared_elapsed = started.elapsed();
     let paths = parts
@@ -923,9 +1200,9 @@ fn convert_at_with_progress(
             let http=client(config.request_timeout_secs)?;
             let mut output_text=String::new();
             for (part,path) in parts.iter().zip(&paths){
-                let text=parse_part_with_limit(&http,base,part,path,config,key,parts.len()>1,progress,output_limit).await?;
+                let text=parse_part_with_limit(&http,base,part,path,config,key,parts.len()>1 || original_start.is_some(),progress,output_limit).await?;
                 ensure!(output_text.len() as u64+text.len()as u64<=output_limit,"MinerU 合并正文超过大小限制");
-                if part.start>0{output_text.push_str(&format!("\n\n<!-- source-pages:{}-{} -->\n\n",part.start,part.end));}
+                if part.start>0 && original_start.is_none(){output_text.push_str(&format!("\n\n<!-- source-pages:{}-{} -->\n\n",part.start,part.end));}
                 output_text.push_str(&text);
             }
             Ok(output_text)

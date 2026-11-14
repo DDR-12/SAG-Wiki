@@ -31,4 +31,6 @@ pub mod protocol;
 pub mod explore;
 pub mod service;
 pub mod server;
+pub mod http_api;
+pub mod api_autostart;
 mod skill_http;

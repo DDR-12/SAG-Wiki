@@ -384,7 +384,7 @@ impl SagTools {
             let scope = self
                 .selected_paths(args.path.as_deref())?
                 .iter()
-                .map(|p| store::path_text(p))
+                .map(|p| self.store.indexed_path(p).and_then(|path| store::path_text(&path)))
                 .collect::<Result<Vec<_>>>()?;
             let refs = self
                 .references
@@ -426,6 +426,7 @@ impl SagTools {
                             &self.cancel,
                         )
                         .await
+                        .map_err(|error| anyhow::Error::new(models::DecisionRequestError(error)))
                     }
                 },
                 |stage, count| (self.progress)(stage, count),
@@ -653,7 +654,7 @@ pub(crate) mod tests {
         assert!(read.sources[0].content.chars().count() < 200);
         assert_eq!(read.data["has_more"], false);
         assert_eq!(read.sources[0].content, text::source_content(&body, &read.sources[0].source_spans));
-        assert_eq!(read.sources[0].source_spans.len(), 2);
+        assert_eq!(read.sources[0].source_spans.len(), 3);
         for span in &read.sources[0].source_spans {
             assert!(!body[span.start_byte..span.end_byte].contains("data:image"));
         }

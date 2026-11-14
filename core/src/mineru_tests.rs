@@ -1,6 +1,41 @@
 use super::*;
 use sag_protocol::mineru::{MineruConfig, MineruProvider};
+#[test]
+fn windows_conversion_destination_is_not_held_open() {
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(windows)]
+    {
+        let held = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        let result = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        assert_eq!(result.persist(held.path()).unwrap_err().error.raw_os_error(), Some(5));
+    }
+    let destination = tempfile::NamedTempFile::new_in(dir.path()).unwrap().into_temp_path();
+    let mut result = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+    result.write_all(b"![figure](images/x.png)").unwrap();
+    result.persist(&destination).unwrap();
+    assert!(std::fs::read_to_string(&destination).unwrap().contains("![figure]"));
+}
 fn default_config()->MineruConfig {MineruConfig{provider:MineruProvider::Ai302,..Default::default()}}
+
+#[test]
+#[ignore = "set SAG_TEST_LARGE_PDF to a local large PDF; no upload"]
+fn real_large_pdf_preparation_with_qpdf() {
+    let source = PathBuf::from(std::env::var_os("SAG_TEST_LARGE_PDF").unwrap()).canonicalize().unwrap();
+    let started = std::time::Instant::now();
+    for page_limit in [PAGE_LIMIT, PDF_SEGMENT_PAGES] {
+    let parts = prepare_with_page_limit(&source, 200 * MIB, page_limit, &RuntimeSettings::default(), &|| false).unwrap();
+    let mut next = 1;
+    for part in &parts {
+        assert_eq!(part.start, next);
+        assert!(part.end - part.start < page_limit);
+        assert_eq!(lopdf::Document::load_mem(&part.bytes).unwrap().get_pages().len(), (part.end - part.start + 1) as usize);
+        next = part.end + 1;
+    }
+    assert_eq!(next - 1, lopdf::Document::load(&source).unwrap().get_pages().len() as u32);
+    assert!(started.elapsed() < Duration::from_secs(120));
+    println!("real PDF page_limit={page_limit} parts={} elapsed_ms={}", parts.len(), started.elapsed().as_millis());
+    }
+}
 
 #[test]
 fn settings_default_disabled_and_provider_keys_are_separate() {
@@ -30,7 +65,7 @@ fn unsupported_formats_stay_local_and_invalid_settings_fail() {
 }
 
 #[test]
-fn archive_markdown_rewrites_relative_images_without_extracting_paths() {
+fn archive_markdown_preserves_relative_images() {
     use std::io::Write;
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     zip.start_file("full.md", zip::write::SimpleFileOptions::default())
@@ -40,8 +75,41 @@ fn archive_markdown_rewrites_relative_images_without_extracting_paths() {
     let archive = zip.finish().unwrap().into_inner();
     let parsed = markdown(archive).unwrap();
     assert!(parsed.contains("# Result"));
-    assert!(!parsed.contains("images/x.png"));
+    assert!(parsed.contains("images/x.png"));
     assert!(parsed.contains("[web](https://example.com)"));
+}
+
+#[test]
+fn archive_assets_survive_markdown_rename_and_isolate_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let make = |bytes: &[u8]| {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, data) in [("full.md", b"# Result\n![caption](images/x.png)\n![title](./images/x.png \"title\")\n![](<images/x.png>)\n<img src='images/x.png'>\n![reference][f]\n[f]: images/x.png".as_slice()), ("images/x.png", bytes)] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(data).unwrap();
+        }
+        zip.start_file("doc_content_list.json", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(br#"[{"type":"image","img_path":"images/x.png","image_caption":["Caption"],"page_idx":0}]"#).unwrap();
+        zip.finish().unwrap().into_inner()
+    };
+    let first = archive_content_with_assets(make(b"first"), 0, 0, false, MIB, Some(dir.path())).unwrap();
+    let second = archive_content_with_assets(make(b"second"), 0, 0, false, MIB, Some(dir.path())).unwrap();
+    assert_ne!(first, second);
+    for (text, expected) in [(&first, b"first".as_slice()), (&second, b"second".as_slice())] {
+        let link = text.split("](").nth(1).unwrap().split(')').next().unwrap();
+        assert_eq!(std::fs::read(dir.path().join(link)).unwrap(), expected);
+        assert!(dir.path().join(link).parent().unwrap().parent().unwrap().join("full.md").exists());
+        assert!(!text.contains("](./images/") && !text.contains("](images/"));
+        assert_eq!(text.matches(".sag-mineru-assets/").count(), 5);
+    }
+    let staged = dir.path().join("pending.md");
+    std::fs::write(&staged, &first).unwrap();
+    std::fs::rename(staged, dir.path().join("report.pdf.md")).unwrap();
+    assert_eq!(archive_content_with_assets(make(b"first"), 0, 0, false, MIB, Some(dir.path())).unwrap(), first);
+    let split = archive_content_with_assets(make(b"first"), 201, 202, true, MIB, Some(dir.path())).unwrap();
+    assert!(split.contains("source-page:201"));
+    assert!(split.contains("Caption"));
+    assert!(split.contains("![](.sag-mineru-assets/"));
 }
 
 #[test]
@@ -71,6 +139,122 @@ fn archive(full: &str, rows: Option<Value>) -> Vec<u8> {
             .unwrap();
     }
     zip.finish().unwrap().into_inner()
+}
+
+#[test]
+fn split_page_mapping_keeps_code_charts_and_drops_running_matter() {
+    let rows = json!([
+        {"type":"header","text":"Running header","page_idx":0},
+        {"type":"footer","text":"Running footer","page_idx":0},
+        {"type":"page_number","text":"- 2 -","page_idx":0},
+        {"type":"text","text":"Chapter","page_idx":0},
+        {"type":"code","code_caption":["Listing 1"],"code_body":"fn main() {\n    let s = \"```\";\n}","guess_lang":"rust","code_footnote":["Run it twice"],"page_idx":1},
+        {"type":"chart","chart_caption":["Sales"],"chart_footnote":["Source"],"page_idx":2},
+        {"type":"aside_text","text":"Margin note","page_idx":2}
+    ]);
+    let output = archive_content(archive("full", Some(rows)), 201, 203, true).unwrap();
+    for expected in [
+        "source-page:201",
+        "source-page:202",
+        "source-page:203",
+        "Chapter",
+        "Listing 1",
+        "````rust\nfn main() {\n    let s = \"```\";\n}\n````",
+        "Run it twice",
+        "Sales",
+        "Source",
+        "Margin note",
+    ] {
+        assert!(output.contains(expected), "missing {expected} in {output}");
+    }
+    for dropped in ["Running header", "Running footer", "- 2 -"] {
+        assert!(!output.contains(dropped), "kept {dropped} in {output}");
+    }
+    // A page holding only running matter keeps no anchor, so citations never point at it.
+    let only_footer = archive_content(
+        archive(
+            "full",
+            Some(json!([{"type":"footer","text":"Foot","page_idx":0},{"type":"text","text":"Body","page_idx":1}])),
+        ),
+        201,
+        202,
+        true,
+    )
+    .unwrap();
+    assert!(!only_footer.contains("source-page:201"), "{only_footer}");
+    assert!(only_footer.contains("source-page:202"), "{only_footer}");
+}
+
+#[test]
+fn split_page_mapping_reads_nested_text_and_keeps_chart_and_code_details() {
+    let rows = json!([
+        {"type":"chart","chart_caption":[{"text":"Nested sales"}],"chart_footnote":["Source"],"page_idx":0},
+        {"type":"chart","page_idx":1},
+        {"type":"chart","chart_footnote":["Loose note"],"page_idx":2},
+        {"type":"text","text":"Body","page_idx":3},
+        {"type":"code","code_body":"print(1)","guess_lang":"objective c","page_idx":4},
+        {"type":"code","code_body":"int x;","code_language":"c++ (17)","page_idx":5}
+    ]);
+    let output = archive_content(archive("full", Some(rows)), 201, 206, true).unwrap();
+    for expected in [
+        "[图片：Nested sales]",
+        "Source",
+        "Loose note",
+        "```objective-c\nprint(1)\n```",
+        "```c++-17\nint x;\n```",
+    ] {
+        assert!(output.contains(expected), "missing {expected} in {output}");
+    }
+    // A chart with no caption and no footnote keeps no anchor, so it cannot be cited.
+    assert!(!output.contains("source-page:202"), "{output}");
+    assert!(output.contains("source-page:203"), "{output}");
+    // The caption nests its text in an object; reporting it as unreadable would be wrong.
+    for page in 201..=206 {
+        assert!(output.contains(&format!("source-page:{page}")) || page == 202, "missing page {page}");
+    }
+}
+
+#[test]
+fn empty_segment_blocks_report_their_page() {
+    let error = archive_content(
+        archive("full", Some(json!([{"type":"table","table_caption":["Only a caption"],"page_idx":0}]))),
+        201,
+        202,
+        true,
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("第 201 页"), "{error:#}");
+    let error = archive_content(
+        archive("full", Some(json!([{"type":"equation","page_idx":1}]))),
+        201,
+        202,
+        true,
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("第 202 页"), "{error:#}");
+}
+
+#[test]
+fn unknown_segment_types_report_type_and_page() {
+    let error = archive_content(
+        archive("full", Some(json!([{"type":"signature_block","page_idx":0}]))),
+        201,
+        203,
+        true,
+    )
+    .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("signature_block"), "{message}");
+    assert!(message.contains("201"), "{message}");
+    // A long type is shortened so remote content cannot flood the diagnostic.
+    let error = archive_content(
+        archive("full", Some(json!([{"type": "x".repeat(80), "page_idx": 0}]))),
+        201,
+        203,
+        true,
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").len() < 200);
 }
 
 #[test]
@@ -140,6 +324,7 @@ fn large_pdf_splits_at_provider_page_limit_and_keeps_original_ranges() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("large.pdf");
     std::fs::write(&source, pdf(201)).unwrap();
+    let source = source.canonicalize().unwrap();
     let parts = prepare(&source, 50 * MIB, &|| false).unwrap();
     assert_eq!(
         parts
@@ -864,4 +1049,200 @@ fn enterprise_response_variants_and_error_codes_are_classified() {
     assert_eq!(find_302_task_id(&json!("A0005")),None);
     assert_eq!(normalize_opensource(json!("A0005")).unwrap()["state"],"failed");
     assert_eq!(normalize_opensource(json!({"data":{"markdown":"# result"}})).unwrap()["markdown"],"# result");
+}
+
+#[tokio::test]
+async fn resumed_expired_task_stops_pending_polling_but_can_recover_completed_result() {
+    for state in ["pending", "running", "converting", "waiting-file", "done"] {
+        let server = Fixture::new(|base| {
+            let mut steps = vec![Step::json(
+                "GET",
+                "/extract-results/batch/old-task",
+                json!({
+                    "code":0,"data":{"extract_result":[{"state":state,"full_zip_url":format!("{base}/result")} ]}
+                }),
+            )];
+            if state == "done" {
+                steps.push(Step {
+                    method: "GET",
+                    path: "/result",
+                    status: 200,
+                    body: archive("# recovered", None),
+                });
+            }
+            steps
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task.json");
+        write_task(
+            &path,
+            &Task {
+                id: Some("old-task".into()),
+                upload: None,
+                uploaded: true,
+                submitted_at: now() - 60,
+                result: None,
+            },
+        )
+        .unwrap();
+        let config = MineruConfig {
+            provider: MineruProvider::Official,
+            task_timeout_secs: 10,
+            ..Default::default()
+        };
+        let part = Part {
+            bytes: pdf(1),
+            start: 1,
+            end: 1,
+            name: "scan.pdf".into(),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            parse_part(
+                &client(5).unwrap(),
+                &server.base,
+                &part,
+                &path,
+                &config,
+                "key",
+                false,
+                &|_| {},
+            ),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "{state}: resumed task restarted its waiting budget"
+        );
+        let result = result.unwrap();
+        if state == "done" {
+            assert!(result.unwrap().contains("recovered"));
+        } else {
+            assert!(result.unwrap_err().to_string().contains("超时"));
+        }
+        assert!(
+            read_task(&path).unwrap().is_some(),
+            "keep journal to avoid duplicate submission"
+        );
+        server.finish(if state == "done" { 2 } else { 1 });
+    }
+}
+
+#[test]
+fn shared_pdf_splitter_uses_fifty_pages_and_preserves_original_ranges() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("long.pdf");
+    std::fs::write(&source, pdf(201)).unwrap();
+    let parts =
+        prepare_pdf_segments(&source, 200 * MIB, &RuntimeSettings::default(), &|| false).unwrap();
+    assert_eq!(
+        parts.iter().map(|p| (p.start, p.end)).collect::<Vec<_>>(),
+        [(1, 50), (51, 100), (101, 150), (151, 200), (201, 201)]
+    );
+    for part in parts {
+        assert_eq!(
+            lopdf::Document::load_mem(&part.bytes)
+                .unwrap()
+                .get_pages()
+                .len(),
+            (part.end - part.start + 1) as usize
+        );
+    }
+}
+
+#[test]
+fn segment_cloud_results_keep_original_page_offsets() {
+    let server = Fixture::new(|base| {
+        vec![
+            Step::json(
+                "POST",
+                "/file-urls/batch",
+                json!({"code":0,"data":{"batch_id":"segment","file_urls":[format!("{base}/storage")]}}),
+            ),
+            Step {
+                method: "PUT",
+                path: "/storage",
+                status: 200,
+                body: vec![],
+            },
+            Step::json(
+                "GET",
+                "/extract-results/batch/segment",
+                json!({"code":0,"data":{"extract_result":[{"state":"done","full_zip_url":format!("{base}/result")} ]}}),
+            ),
+            Step {
+                method: "GET",
+                path: "/result",
+                status: 200,
+                body: archive(
+                    "full",
+                    Some(json!([
+                        {"type":"text","text":"first segment page","page_idx":0},
+                        {"type":"text","text":"second segment page","page_idx":1}
+                    ])),
+                ),
+            },
+        ]
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("segment.pdf");
+    let output = dir.path().join("out.md");
+    std::fs::write(&source, pdf(2)).unwrap();
+    let config = MineruConfig {
+        provider: MineruProvider::Official,
+        ..Default::default()
+    };
+    convert_range_at_with_progress(
+        &source,
+        &output,
+        &config,
+        "key",
+        &|| false,
+        &server.base,
+        &RuntimeSettings::default(),
+        &|_| {},
+        Some(51),
+    )
+    .unwrap();
+    let text = std::fs::read_to_string(output).unwrap();
+    assert!(text.contains("source-page:51"));
+    assert!(text.contains("source-page:52"));
+    assert!(text.contains("id=\"page-51\""));
+    assert!(!text.contains("source-page:1"));
+    server.finish(4);
+}
+
+#[test]
+fn shared_pdf_page_limit_remains_a_resource_failure() {
+    let dir=tempfile::tempdir().unwrap();let source=dir.path().join("long.pdf");
+    std::fs::write(&source,pdf(51)).unwrap();
+    let runtime=RuntimeSettings{max_document_pages:50,..Default::default()};
+    let error=prepare_pdf_segments(&source,200*MIB,&runtime,&||false).unwrap_err();
+    assert!(crate::conversion::resource_failure(&error));
+}
+
+#[test]
+fn archive_assets_rewrite_nested_alt_and_space_destinations() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    zip.start_file("full.md", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(b"# Result\n![curve [red]](images/x.png)\n![escaped \\] bracket](images/x.png)\n![](<images/my image.png>)").unwrap();
+    for name in ["images/x.png", "images/my image.png"] {
+        zip.start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"image").unwrap();
+    }
+    let output = archive_content_with_assets(
+        zip.finish().unwrap().into_inner(),
+        0,
+        0,
+        false,
+        MIB,
+        Some(dir.path()),
+    )
+    .unwrap();
+    assert_eq!(output.matches(".sag-mineru-assets/").count(), 3, "{output}");
+    assert!(output.contains("curve [red]") && output.contains("escaped \\] bracket"));
+    assert!(!output.contains("](images/") && !output.contains("](<images/"));
 }

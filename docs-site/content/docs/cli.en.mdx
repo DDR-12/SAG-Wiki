@@ -17,6 +17,8 @@ sag
 
 The published `@zleap-ai/sag` contains native executables for these two platforms. Rust, source compilation and desktop installation are unnecessary. npm registers the `sag` command. Reuse an existing working `sag` installation.
 
+Standalone CLI and npm packaging place the QPDF runtime, its required libraries, and licenses beside the native `sag` executable; packaged installations need no separate QPDF installation. Source installation also requires Node.js to prepare the helper.
+
 The first interactive run of `sag` guides configuration of the JEV retrieval service. The endpoint and model prompts show their current values; press Enter to keep them. First-time setup requires a key, entered with hidden input. The default endpoint is `https://api.zleap.com/v1`, and the model is `Zev-1`. Create the API key in the [Zleap Open Platform console](https://platform.zleap.com/console). CLI search needs only this retrieval configuration. The answer model is configured separately in desktop.
 
 If no terminal was available during installation, the first terminal invocation of `sag` or `sag "search query"` opens the same setup flow. When started from a search, saving configuration resumes the original query. Existing keys automatically reuse the current configuration. Ctrl+C cancels; nothing is saved until setup finishes. Run `sag config` to configure it again at any time.
@@ -150,6 +152,14 @@ notes/draft-*.md
 Git ignore syntax is supported, including `*`, `**`, trailing-`/` directory rules and `!` exceptions. If a parent directory is entirely ignored, first unignore it before including its files again. Existing directory-name exclusions and manually removed subdirectories still apply; `!` cannot override them.
 
 Standalone mode rechecks the index before the next search. With desktop auto-watching enabled, creating, modifying, deleting or renaming a rule file rechecks the project, removing newly ignored entries from the index and indexing newly included files. When watching is disabled, use reindexing in File settings. Rules do not delete or hide local files; the SAG file tree still browses them. Only manually removed subdirectories are hidden from the tree.
+
+## HTTP API
+
+Use `sag api start` and `sag api stop` to manage the HTTP service. Stopping the API leaves indexing and ordinary CLI searches running. `sag api status --json` reads its state without starting the backend.
+
+Create a key with `sag api key create --name "Application A"`. The complete key is shown only once. List or revoke keys with `sag api key list` and `sag api key revoke KEY_ID`. Key creation and listing accept `--json`.
+
+Local and LAN applications can call fast or deep search, browse folders and choose multiple directories by their absolute server paths. The CLI's existing search syntax remains unchanged. See the [API overview](/en/docs/api-guide) for setup and [API reference](/en/docs/api) for endpoints.
 
 ## Installation locations and upgrades
 

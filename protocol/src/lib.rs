@@ -5,6 +5,8 @@ mod cli;
 pub mod explore;
 mod retrieval;
 pub mod types;
+mod api;
+pub use api::ApiAction;
 pub use build::*;
 pub use cli::*;
 use explore::*;
@@ -129,12 +131,28 @@ pub struct IndexStatus {
     pub tasks: Vec<IndexTask>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConversionSegment {
+    pub current: usize,
+    pub total: usize,
+    pub start_page: u32,
+    pub end_page: u32,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IndexConversion {
+    pub path: String,
+    pub engine: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment: Option<ConversionSegment>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IndexTask {
     pub path: String,
     pub stage: String,
     pub completed: usize,
     pub total: usize,
     pub files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conversions: Vec<IndexConversion>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IndexHistory {
@@ -195,6 +213,7 @@ pub struct EventEnvelope {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "args", rename_all = "snake_case")]
 pub enum Operation {
+    Api { action: ApiAction },
     DoclingStatus,
     InstallDocling,
     ImportDoclingComponent {
@@ -391,6 +410,7 @@ pub enum Operation {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Output {
+    Api(serde_json::Value),
     Docling(DoclingStatus),
     IndexStatus(IndexStatus),
     IndexHistory(Vec<IndexHistory>),
